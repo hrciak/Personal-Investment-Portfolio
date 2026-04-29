@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Portfolio Analytics</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --surface: #131820;
+      --card: #181d27;
+      --border: #1e2a3a;
+      --t1: #e8eaf0;
+      --t2: #5a6478;
+      --pos: #2dce89;
+      --neg: #f25f70;
+      --accent: #4f8ef7;
+      --gold: #e6a817;
+      --warn: #f0a04f;
+    }
+    
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg); color: var(--t1);
+      font-family: 'DM Sans', sans-serif;
+      padding: 0 0 100px 0;
+    }
+    
+    /* UTILS */
+    .mono { font-family: 'IBM Plex Mono', monospace; }
+    .pos { color: var(--pos); }
+    .neg { color: var(--neg); }
+    .neu { color: var(--t2); }
+    .accent { color: var(--accent); }
+    .gold { color: var(--gold); }
+    
+    /* HEADER */
+    .header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 24px 32px; border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .header h1 {
+      font-family: 'IBM Plex Mono', monospace; color: var(--accent);
+      letter-spacing: 0.15em; font-size: 20px; font-weight: 600; text-transform: uppercase;
+    }
+    .badges {
+      display: flex; gap: 8px;
+    }
+    .badge {
+      background: rgba(79, 142, 247, 0.1); color: var(--accent);
+      padding: 4px 10px; border-radius: 12px; font-size: 11px;
+      border: 1px solid rgba(79, 142, 247, 0.2); font-family: 'IBM Plex Mono', monospace;
+    }
+    .actions { display: flex; align-items: center; gap: 16px; font-size: 12px; color: var(--t2); }
+    .btn {
+      background: var(--accent); color: #fff; border: none; padding: 8px 16px;
+      border-radius: 6px; cursor: pointer; font-family: 'DM Sans', sans-serif;
+      font-weight: 600; font-size: 12px;
+    }
+    .btn:hover { opacity: 0.9; }
+
+    .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+    
+    /* EMPTY STATE */
+    .empty-state {
+        text-align: center; margin-top: 100px; color: var(--t2); padding: 40px; border: 1px dashed var(--border);
+        border-radius: 8px; background: var(--surface);
+    }
+
+    /* KPI ROW */
+    .kpi-row { display: flex; gap: 16px; margin-bottom: 24px; }
+    .kpi-card {
+      flex: 1; background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      padding: 20px; display: flex; flex-direction: column; gap: 8px;
+    }
+    .kpi-label { font-size: 11px; color: var(--t2); text-transform: uppercase; font-weight: 600; }
+    .kpi-val { font-size: 26px; font-family: 'IBM Plex Mono', monospace; font-weight: 500; }
+    .kpi-sub { font-size: 12px; color: var(--t2); }
+
+    /* RISK ROW */
+    .risk-row { display: flex; gap: 16px; margin-bottom: 24px; }
+    .risk-card {
+      flex: 1; background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      padding: 16px; display: flex; flex-direction: column; gap: 4px;
+    }
+    .risk-label { font-size: 10px; color: var(--t2); text-transform: uppercase; display: flex; justify-content: space-between; }
+    .risk-val { font-size: 16px; font-family: 'IBM Plex Mono', monospace; }
+    .tooltip { cursor: help; color: var(--t2); }
+
+    /* CHARTS */
+    .charts-row { display: grid; grid-template-columns: 65% 1fr; gap: 16px; margin-bottom: 24px; }
+    .chart-box { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+    .chart-title { font-size: 11px; color: var(--t2); text-transform: uppercase; font-weight: 600; margin-bottom: 16px; }
+
+    /* TABLE */
+    .section-title { font-size: 11px; letter-spacing: 1.5px; color: var(--t2); text-transform: uppercase; font-weight: 600; margin: 32px 0 12px; }
+    .table-wrap { overflow-x: auto; background: var(--card); border: 1px solid var(--border); border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    thead th {
+      background: var(--surface); padding: 10px 14px; text-align: right;
+      font-size: 10px; letter-spacing: 1.2px; color: var(--t2);
+      text-transform: uppercase; font-weight: 600; position: sticky; top: 0;
+      border-bottom: 1px solid var(--border); cursor: pointer; white-space: nowrap;
+    }
+    thead th:first-child { text-align: left; }
+    td { padding: 12px 14px; border-bottom: 1px solid var(--border); text-align: right; font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
+    td:first-child { text-align: left; }
+    tr:nth-child(even) { background: #131820; }
+    tr:nth-child(odd) { background: #0f1318; }
+    tbody tr:hover { background: rgba(79,142,247,0.05); }
+    
+    .cell-pnl.pos { background: rgba(45, 206, 137, 0.08); color: var(--pos); }
+    .cell-pnl.neg { background: rgba(242, 95, 112, 0.08); color: var(--neg); }
+
+    .class-pill {
+      font-family: 'DM Sans', sans-serif; font-size: 10px; padding: 2px 6px; border-radius: 4px;
+      text-transform: uppercase; font-weight: 600;
+    }
+    .class-stock { background: rgba(79, 142, 247, 0.1); color: var(--accent); }
+    .class-crypto { background: rgba(230, 168, 23, 0.1); color: var(--gold); }
+    .class-cash { background: rgba(90, 100, 120, 0.1); color: var(--t2); }
+
+    .type-badge {
+      font-family: 'DM Sans', sans-serif; font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 600;
+    }
+    .type-buy { background: rgba(45,206,137,0.1); color: var(--pos); }
+    .type-sell { background: rgba(242,95,112,0.1); color: var(--neg); }
+    .type-div { background: rgba(230,168,23,0.1); color: var(--gold); }
+    .type-tax { background: rgba(240,160,79,0.1); color: var(--warn); }
+    .type-other { background: rgba(90,100,120,0.1); color: var(--t1); }
+
+    details { margin-top: 24px; }
+    summary { font-size: 11px; letter-spacing: 1.5px; color: var(--t2); text-transform: uppercase; font-weight: 600; cursor: pointer; outline: none; margin-bottom: 12px; }
+
+  </style>
+</head>
+<body>
+
+  {% macro fmt_eur(val, p=2) %}{% if val != None %}€{{ "{:,.{}f}".format(val, p) }}{% else %}N/A{% endif %}{% endmacro %}
+  {% macro fmt_pct(val) %}{% if val != None %}{{ "{:,.2f}".format(val) }}%{% else %}N/A{% endif %}{% endmacro %}
+  {% macro color_cls(val) %}{% if val and val > 0 %}pos{% elif val and val < 0 %}neg{% else %}neu{% endif %}{% endmacro %}
+  {% macro format_qty(qty, is_crypto) %}{% if is_crypto %}{{ "{:,.8f}".format(qty) }}{% else %}{{ "{:,.4f}".format(qty) }}{% endif %}{% endmacro %}
+
+  <div class="header">
+    <h1>Portfolio</h1>
+    <div class="badges">
+      {% for s in sources_loaded %}
+        <div class="badge">{{ s }}</div>
+      {% endfor %}
+    </div>
+    <div class="actions">
+      <span>{{ transactions | length }} TXs parsed</span>
+      <span>|</span>
+      <span>Updated: {{ last_updated if last_updated else 'Never' }}</span>
+      <button class="btn" onclick="reload()">Reload Engine</button>
+    </div>
+  </div>
+
+  <div class="container">
+    {% if not transactions %}
+        <div class="empty-state">
+            <h2>No Portfolio Data Found</h2>
+            <p style="margin-top: 10px;">Drop your XTB (.xlsx) or Bitpanda (.csv) files into the <code>/transactions/</code> folder, then click Reload.</p>
+        </div>
+    {% else %}
+
+    <!-- KPI ROW -->
+    <div class="kpi-row">
+      <div class="kpi-card">
+        <div class="kpi-label">Total Value</div>
+        <div class="kpi-val">{{ fmt_eur(kpis.total_value) }}</div>
+        <div class="kpi-sub">Net Worth</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Total PnL</div>
+        <div class="kpi-val {{ color_cls(kpis.total_pnl) }}">{{ fmt_eur(kpis.total_pnl) }}</div>
+        <div class="kpi-sub {{ color_cls(kpis.total_pnl) }}">{{ fmt_pct(kpis.total_pnl_pct) }}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label" title="Internal rate of return on all cash flows">XIRR <span class="tooltip">ⓘ</span></div>
+        <div class="kpi-val {{ color_cls(kpis.xirr) }}">{{ fmt_pct(kpis.xirr) }}</div>
+        <div class="kpi-sub">Annualized</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Realized PnL</div>
+        <div class="kpi-val {{ color_cls(kpis.realized_pnl) }}">{{ fmt_eur(kpis.realized_pnl) }}</div>
+        <div class="kpi-sub">Includes dividends & taxes</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Dividend Income</div>
+        <div class="kpi-val gold">{{ fmt_eur(kpis.dividend_income) }}</div>
+        <div class="kpi-sub">Gross received</div>
+      </div>
+    </div>
+
+    <!-- RISK ROW -->
+    <div class="risk-row">
+      <div class="risk-card">
+        <div class="risk-label">Ann. Volatility <span class="tooltip" title="Annualized standard deviation of daily returns">ⓘ</span></div>
+        <div class="risk-val">{{ fmt_pct(risk.volatility) }}</div>
+      </div>
+      <div class="risk-card">
+        <div class="risk-label">Sharpe Ratio <span class="tooltip" title="Risk-adjusted return (assumes 2.5% risk-free rate)">ⓘ</span></div>
+        <div class="risk-val">{{ "{:,.2f}".format(risk.sharpe_ratio) if risk.sharpe_ratio != None else 'N/A' }}</div>
+      </div>
+      <div class="risk-card">
+        <div class="risk-label">Max Drawdown <span class="tooltip" title="Maximum observed loss from a peak">ⓘ</span></div>
+        <div class="risk-val neg">{{ fmt_pct(risk.max_drawdown) }}</div>
+      </div>
+      <div class="risk-card">
+        <div class="risk-label">Portfolio Beta <span class="tooltip" title="Volatility relative to S&P 500">ⓘ</span></div>
+        <div class="risk-val neu">N/A</div>
+      </div>
+    </div>
+
+    <!-- CHARTS ROW -->
+    <div class="charts-row">
+      <div class="chart-box">
+        <div class="chart-title">Net Worth Timeline</div>
+        <canvas id="nwChart" height="250"></canvas>
+      </div>
+      <div class="chart-box">
+        <div class="chart-title">Asset Allocation</div>
+        <canvas id="allocChart" height="250"></canvas>
+      </div>
+    </div>
+
+    <!-- POSITIONS TABLE -->
+    <div class="section-title">Open Positions</div>
+    <div class="table-wrap">
+      <table id="tbl-pos">
+        <thead>
+          <tr>
+            <th onclick="sortTable('tbl-pos', 0, false)">Ticker</th>
+            <th onclick="sortTable('tbl-pos', 1, false)">Class</th>
+            <th onclick="sortTable('tbl-pos', 2, true)">Qty</th>
+            <th onclick="sortTable('tbl-pos', 3, true)">Avg Cost</th>
+            <th onclick="sortTable('tbl-pos', 4, true)">Live Price</th>
+            <th onclick="sortTable('tbl-pos', 5, true)">Mkt Value</th>
+            <th onclick="sortTable('tbl-pos', 6, true)">Unr. PnL €</th>
+            <th onclick="sortTable('tbl-pos', 7, true)">Unr. PnL %</th>
+            <th onclick="sortTable('tbl-pos', 8, true)">Real. PnL €</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in positions %}
+          <tr>
+            <td style="font-family: 'DM Sans', sans-serif; font-weight:600; font-size:13px">{{ p.ticker }}</td>
+            <td>
+              {% if p.asset_class == 'Crypto' %}<span class="class-pill class-crypto">Crypto</span>
+              {% elif p.asset_class == 'Stock/ETF' %}<span class="class-pill class-stock">Stock/ETF</span>
+              {% else %}<span class="class-pill class-cash">Cash</span>{% endif %}
+            </td>
+            <td>{{ format_qty(p.qty, p.asset_class == 'Crypto') }}</td>
+            <td>{{ fmt_eur(p.avg_cost) }}</td>
+            <td>{{ fmt_eur(p.price) }}</td>
+            <td>{{ fmt_eur(p.market_value) }}</td>
+            <td class="cell-pnl {{ color_cls(p.unrealized_pnl) }}">{{ fmt_eur(p.unrealized_pnl) }}</td>
+            <td class="cell-pnl {{ color_cls(p.unrealized_pnl_pct) }}">{{ fmt_pct(p.unrealized_pnl_pct) }}</td>
+            <td class=" {{ color_cls(p.realized_pnl) }}">{{ fmt_eur(p.realized_pnl) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- DIVIDENDS TABLE -->
+    {% if dividends %}
+    <details>
+      <summary>Dividends Breakdown ({{ dividends|length }} Assets)</summary>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Ticker</th>
+              <th>Total EUR</th>
+              <th>Yield %</th>
+              <th>Count</th>
+              <th>Last Payment</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for d in dividends %}
+            <tr>
+              <td style="text-align: left;">{{ d.ticker }}</td>
+              <td class="gold">{{ fmt_eur(d.total_eur) }}</td>
+              <td>{{ fmt_pct(d.yield_pct) }}</td>
+              <td>{{ d.count }}</td>
+              <td>{{ d.last_date }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+    {% endif %}
+
+    <!-- TRANSACTIONS TABLE -->
+    <div class="section-title">Transactions History</div>
+    <div class="table-wrap">
+      <table id="tbl-tx">
+        <thead>
+          <tr>
+            <th onclick="sortTable('tbl-tx', 0, false)">Date</th>
+            <th onclick="sortTable('tbl-tx', 1, false)">Source</th>
+            <th onclick="sortTable('tbl-tx', 2, false)">Ticker</th>
+            <th onclick="sortTable('tbl-tx', 3, false)">Type</th>
+            <th onclick="sortTable('tbl-tx', 4, true)">Qty</th>
+            <th onclick="sortTable('tbl-tx', 5, true)">Price €</th>
+            <th onclick="sortTable('tbl-tx', 6, true)">Total €</th>
+            <th onclick="sortTable('tbl-tx', 7, true)">Fee €</th>
+            <th onclick="sortTable('tbl-tx', 8, true)">Running Cash €</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for t in transactions %}
+          <tr>
+            <td style="text-align: left;">{{ t.date }}</td>
+            <td>{{ t.source }}</td>
+            <td>{{ t.ticker }}</td>
+            <td>
+              {% if t.type == 'BUY' %}<span class="type-badge type-buy">BUY</span>
+              {% elif t.type == 'SELL' %}<span class="type-badge type-sell">SELL</span>
+              {% elif t.type == 'DIVIDEND' %}<span class="type-badge type-div">DIVIDEND</span>
+              {% elif t.type == 'WITHHOLDING_TAX' %}<span class="type-badge type-tax">TAX</span>
+              {% else %}<span class="type-badge type-other">{{ t.type }}</span>{% endif %}
+            </td>
+            <td>{{ format_qty(t.qty, t.asset_class == 'Crypto') }}</td>
+            <td>{{ fmt_eur(t.price) }}</td>
+            <td {% if t.type in ['BUY', 'WITHDRAWAL', 'WITHHOLDING_TAX'] %}class="neg"{% else %}class="pos"{% endif %}>
+              {% if t.type in ['BUY', 'WITHDRAWAL', 'WITHHOLDING_TAX'] %}-{% else %}+{% endif %}{{ fmt_eur(t.total) }}
+            </td>
+            <td class="neg">{{ fmt_eur(t.fee) }}</td>
+            <td class="neu">{{ fmt_eur(t.running_cash) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    {% endif %}
+  </div>
+
+  <script>
+    async function reload() {
+      const btn = document.querySelector('.btn');
+      btn.textContent = 'Parsing...';
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/reload', { method: 'POST' });
+        if(res.ok) window.location.reload();
+      } catch(e) {
+        alert('Failed to reload');
+      }
+    }
+
+    // Chart configs if data exists
+    {% if charts and charts.dates|length > 0 %}
+    Chart.defaults.color = '#5a6478';
+    Chart.defaults.font.family = "'DM Sans', sans-serif";
+
+    const dates = {{ charts.dates | tojson }};
+    const nwData = {{ charts.net_worth | tojson }};
+    const invData = {{ charts.invested | tojson }};
+    const benchData = {{ charts.benchmark | tojson }};
+
+    new Chart(document.getElementById('nwChart'), {
+      type: 'line',
+      data: {
+        labels: dates,
+        datasets: [
+          {
+            label: 'Portfolio Value',
+            data: nwData,
+            borderColor: '#4f8ef7',
+            backgroundColor: 'rgba(79, 142, 247, 0.1)',
+            borderWidth: 2,
+            tension: 0.2,
+            pointRadius: 0,
+            yAxisID: 'y'
+          },
+          {
+            label: 'Invested Capital',
+            data: invData,
+            borderColor: 'rgba(232, 234, 240, 0.4)',
+            borderWidth: 1.5,
+            borderDash: [5, 5],
+            pointRadius: 0,
+            yAxisID: 'y'
+          },
+          {
+            label: 'S&P 500 (Base 100)',
+            data: benchData,
+            borderColor: '#e6a817',
+            borderWidth: 1,
+            borderDash: [2, 2],
+            pointRadius: 0,
+            yAxisID: 'y1'
+          }
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom', labels: { boxWidth: 12 } },
+          tooltip: {
+            callbacks: {
+              label: function(ctx) {
+                if(ctx.datasetIndex === 2) return ctx.dataset.label + ': ' + ctx.raw.toFixed(2);
+                return ctx.dataset.label + ': €' + ctx.raw.toLocaleString(undefined, {minimumFractionDigits:2});
+              }
+            }
+          }
+        },
+        interaction: { mode: 'index', intersect: false },
+        scales: {
+          x: { grid: { color: '#1e2a3a' }, ticks: { maxTicksLimit: 10 } },
+          y: { grid: { color: '#1e2a3a' }, type: 'linear', display: true, position: 'left' },
+          y1: { grid: { drawOnChartArea: false }, type: 'linear', display: true, position: 'right' }
+        }
+      }
+    });
+
+    const alloc = {{ allocation | tojson }};
+    new Chart(document.getElementById('allocChart'), {
+      type: 'doughnut',
+      data: {
+        labels: ['Stock/ETF', 'Crypto', 'Cash'],
+        datasets: [{
+          data: [alloc['Stock/ETF'] || 0, alloc['Crypto'] || 0, alloc['Cash'] || 0],
+          backgroundColor: ['#4f8ef7', '#e6a817', '#5a6478'],
+          borderWidth: 0
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        cutout: '75%',
+        plugins: {
+          legend: { position: 'bottom', labels: { usePointStyle: true, boxWidth: 8 } },
+          tooltip: {
+            callbacks: {
+              label: function(ctx) {
+                return ' €' + ctx.raw.toLocaleString(undefined, {minimumFractionDigits:2});
+              }
+            }
+          }
+        }
+      }
+    });
+    {% endif %}
+
+    // Basic Table Sort
+    function sortTable(tableId, col, isNumeric) {
+      const table = document.getElementById(tableId);
+      const tb = table.tBodies[0];
+      const rows = Array.from(tb.rows);
+      // toggle asc/desc
+      let asc = table.getAttribute('data-sort-asc') === 'true';
+      if(table.getAttribute('data-sort-col') == col) {
+        asc = !asc;
+      } else {
+        asc = true;
+      }
+      table.setAttribute('data-sort-col', col);
+      table.setAttribute('data-sort-asc', asc);
+
+      rows.sort((a, b) => {
+        let v1 = a.cells[col].innerText.replace(/[^0-9.-]+/g,"");
+        let v2 = b.cells[col].innerText.replace(/[^0-9.-]+/g,"");
+        if(isNumeric) {
+          v1 = parseFloat(v1) || 0;
+          v2 = parseFloat(v2) || 0;
+          return asc ? v1 - v2 : v2 - v1;
+        } else {
+          v1 = a.cells[col].innerText;
+          v2 = b.cells[col].innerText;
+          return asc ? v1.localeCompare(v2) : v2.localeCompare(v1);
+        }
+      });
+      rows.forEach(r => tb.appendChild(r));
+    }
+  </script>
+</body>
+</html>
