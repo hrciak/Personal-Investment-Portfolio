@@ -92,16 +92,18 @@ def compute_portfolio(transactions: list[dict]) -> dict:
                 p = positions_data[ticker]
                 # Use running avg cost (cost of remaining shares) not all-time avg
                 avg_cost = p["running_cost_basis"] / p["running_qty"] if p["running_qty"] > 0 else 0
-                
+
                 if pd.notna(real_pnl_val) and real_pnl_val is not None:
-                    p["realized_pnl"] += real_pnl_val
+                    realized = real_pnl_val
                 else:
-                    p["realized_pnl"] += proceeds - (avg_cost * qty)
-                    
+                    realized = proceeds - (avg_cost * qty)
+                p["realized_pnl"] += realized
+
                 p["running_qty"] -= qty
                 p["running_cost_basis"] -= (avg_cost * qty)
                 p["realized_count"] += 1
                 source_metrics[src]["fees"] += fee
+                source_metrics[src]["realized_pnl"] += realized
                 
         elif tx_type == "DIVIDEND":
             cash_balance += qty * price
@@ -213,15 +215,28 @@ def compute_portfolio(transactions: list[dict]) -> dict:
     # Dividend yield on cost
     div_yield_on_cost = (dividend_income / total_invested_gross * 100) if total_invested_gross > 0 else 0
     
+    # Per-source current holdings (market value, unrealized PnL, open count)
+    per_src_holdings = {}
+    for pos in open_positions:
+        s = pos["source"]
+        d = per_src_holdings.setdefault(s, {"market_value": 0.0, "unrealized_pnl": 0.0, "count": 0})
+        d["market_value"] += pos["market_value"]
+        d["unrealized_pnl"] += pos["unrealized_pnl"]
+        d["count"] += 1
+
     # Source breakdown for dashboard
     source_breakdown = []
     for src_name, metrics in source_metrics.items():
+        h = per_src_holdings.get(src_name, {"market_value": 0.0, "unrealized_pnl": 0.0, "count": 0})
         source_breakdown.append({
             "name": src_name,
             "invested": metrics["invested"],
             "realized_pnl": metrics["realized_pnl"],
             "fees": metrics["fees"],
-            "dividends": metrics["dividends"]
+            "dividends": metrics["dividends"],
+            "market_value": h["market_value"],
+            "unrealized_pnl": h["unrealized_pnl"],
+            "positions_count": h["count"],
         })
 
     # XIRR

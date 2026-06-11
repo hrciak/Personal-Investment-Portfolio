@@ -74,6 +74,19 @@
       border-color: rgba(230, 168, 23, 0.2);
     }
     .badge-bitpanda:hover { background: rgba(230, 168, 23, 0.2); }
+    .badge-xtb {
+      background: rgba(165, 28, 28, 0.18); color: #f08a8a;
+      border-color: rgba(165, 28, 28, 0.45);
+    }
+    .badge-xtb:hover { background: rgba(165, 28, 28, 0.30); }
+    .badge-trading212 {
+      background: rgba(79, 175, 247, 0.12); color: #6fc2ff;
+      border-color: rgba(79, 175, 247, 0.30);
+    }
+    .badge-trading212:hover { background: rgba(79, 175, 247, 0.22); }
+    .badge-clickable { cursor: pointer; font-family: 'IBM Plex Mono', monospace; }
+    .badge-soon { opacity: 0.55; cursor: not-allowed; }
+    .badge-soon:hover { transform: none; }
     .actions { display: flex; align-items: center; gap: 16px; font-size: 12px; color: var(--t2); }
     .btn {
       background: linear-gradient(135deg, var(--accent), #3a6fd8); color: #fff; border: none; padding: 8px 16px;
@@ -317,6 +330,24 @@
       display: flex; justify-content: flex-end;
     }
     
+    /* PLATFORM MODAL */
+    .platform-modal-content { border-color: rgba(79,142,247,0.3); max-width: 440px; box-shadow: 0 10px 30px rgba(0,0,0,0.5), 0 0 15px rgba(79,142,247,0.1); }
+    .platform-modal-header h3 { color: var(--t1); }
+    .platform-hero {
+      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      padding: 20px; text-align: center; margin-bottom: 16px;
+    }
+    .platform-hero-label { font-size: 11px; color: var(--t2); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+    .platform-hero-val { font-size: 30px; font-weight: 500; margin: 6px 0 2px; color: var(--accent); }
+    .platform-hero-sub { font-size: 12px; color: var(--t2); }
+    .platform-grid { display: flex; flex-direction: column; gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .platform-stat {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 12px 16px; background: var(--card); font-size: 13px;
+    }
+    .platform-stat > span:first-child { color: var(--t2); }
+    .platform-stat .mono { font-size: 13px; }
+
     @keyframes fadeIn {
       from { opacity: 0; }
       to { opacity: 1; }
@@ -377,12 +408,44 @@
     </div>
   {% endif %}
 
+  <!-- PLATFORM DETAIL MODAL -->
+  <div id="platform-modal" class="modal-overlay" style="display:none;">
+    <div class="modal-content platform-modal-content">
+      <div class="modal-header platform-modal-header">
+        <h3 id="platform-modal-title"><span class="source-dot" id="platform-modal-dot"></span><span id="platform-modal-name"></span></h3>
+        <button class="modal-close" onclick="closePlatformModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="platform-hero">
+          <div class="platform-hero-label">Current Holdings Value</div>
+          <div class="platform-hero-val mono" id="pm-market-value">€0.00</div>
+          <div class="platform-hero-sub" id="pm-positions">0 open positions</div>
+        </div>
+        <div class="platform-grid">
+          <div class="platform-stat"><span>Invested</span><span class="mono" id="pm-invested">€0.00</span></div>
+          <div class="platform-stat"><span>Unrealized P/L</span><span class="mono" id="pm-unrealized">€0.00</span></div>
+          <div class="platform-stat"><span>Realized P/L</span><span class="mono" id="pm-realized">€0.00</span></div>
+          <div class="platform-stat"><span>Dividends</span><span class="mono" id="pm-dividends">€0.00</span></div>
+          <div class="platform-stat"><span>Fees paid</span><span class="mono" id="pm-fees">€0.00</span></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closePlatformModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
   <div class="header">
     <h1>Portfolio</h1>
     <div class="badges">
       {% for s in sources_loaded %}
-        <div class="badge {% if s == 'eToro' %}badge-etoro{% elif s == 'Bitpanda' %}badge-bitpanda{% endif %}">{{ s }}</div>
+        <button type="button"
+          class="badge badge-clickable {% if s == 'eToro' %}badge-etoro{% elif s == 'Bitpanda' %}badge-bitpanda{% elif s == 'XTB' %}badge-xtb{% elif s == 'Trading212' %}badge-trading212{% endif %}"
+          onclick="openPlatformModal('{{ s }}')">{{ s }}</button>
       {% endfor %}
+      {% if 'Trading212' not in sources_loaded %}
+        <button type="button" class="badge badge-trading212 badge-soon" title="Drop a Trading212 statement into broker-statements/ to enable" disabled>Trading212 · soon</button>
+      {% endif %}
     </div>
     <div class="actions">
       <span>{{ transactions | length }} TXs parsed</span>
@@ -689,6 +752,41 @@
       }
     }
 
+    // --- Platform detail modal ---
+    const PLATFORM_DATA = {{ source_breakdown | tojson }};
+    const PLATFORM_COLORS = { XTB: '#f08a8a', Bitpanda: '#e6a817', eToro: '#2dce89', Trading212: '#6fc2ff' };
+
+    function fmtEur(v) {
+      if (v === null || v === undefined) return 'N/A';
+      return '€' + Number(v).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    }
+
+    function openPlatformModal(name) {
+      const d = PLATFORM_DATA.find(s => s.name === name);
+      if (!d) return;
+      document.getElementById('platform-modal-name').textContent = name;
+      document.getElementById('platform-modal-dot').style.background = PLATFORM_COLORS[name] || '#5a6478';
+      document.getElementById('pm-market-value').textContent = fmtEur(d.market_value);
+      document.getElementById('pm-positions').textContent = (d.positions_count || 0) + ' open position' + (d.positions_count === 1 ? '' : 's');
+      document.getElementById('pm-invested').textContent = fmtEur(d.invested);
+
+      const unreal = document.getElementById('pm-unrealized');
+      unreal.textContent = fmtEur(d.unrealized_pnl);
+      unreal.className = 'mono ' + (d.unrealized_pnl > 0 ? 'pos' : d.unrealized_pnl < 0 ? 'neg' : 'neu');
+
+      const real = document.getElementById('pm-realized');
+      real.textContent = fmtEur(d.realized_pnl);
+      real.className = 'mono ' + (d.realized_pnl > 0 ? 'pos' : d.realized_pnl < 0 ? 'neg' : 'neu');
+
+      document.getElementById('pm-dividends').textContent = fmtEur(d.dividends);
+      document.getElementById('pm-fees').textContent = fmtEur(d.fees);
+      document.getElementById('platform-modal').style.display = 'flex';
+    }
+
+    function closePlatformModal() {
+      document.getElementById('platform-modal').style.display = 'none';
+    }
+
     async function reloadEngine() {
       const btn = document.querySelector('.btn');
       const originalText = btn.textContent;
@@ -712,11 +810,13 @@
 
     // Close modal on escape or clicking outside
     window.addEventListener('keydown', function(e) {
-      if (e.key === 'Escape') closeErrorModal();
+      if (e.key === 'Escape') { closeErrorModal(); closePlatformModal(); }
     });
     window.addEventListener('click', function(e) {
       const modal = document.getElementById('error-modal');
       if (e.target === modal) closeErrorModal();
+      const pmodal = document.getElementById('platform-modal');
+      if (e.target === pmodal) closePlatformModal();
     });
 
     // Chart configs if data exists

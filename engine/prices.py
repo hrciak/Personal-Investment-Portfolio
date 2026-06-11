@@ -114,22 +114,39 @@ def get_benchmark_series(start_date: str, end_date: str) -> dict[str, float]:
     if cache_key in _benchmark_cache:
         return _benchmark_cache[cache_key]
 
-    try:
-        df = yf.download("^GSPC", start=start_date, end=end_date, progress=False, auto_adjust=True)
-        if df.empty or "Close" not in df:
-            return {}
-        close_series = df["Close"].dropna()
-        if close_series.empty:
-            return {}
-        
-        # Normalize to 100
-        first_val = float(close_series.iloc[0])
-        # Format keys as YYYY-MM-DD
-        series_dict = {str(idx.date()): (float(val) / first_val * 100) for idx, val in close_series.items()}
-        _benchmark_cache[cache_key] = series_dict
-        return series_dict
-    except Exception:
-        return {}
+    # ^GSPC (the index) frequently times out / rate-limits on Yahoo. Try it first,
+    # then fall back to liquid S&P 500 ETFs which resolve far more reliably.
+    for symbol in ("^GSPC", "SPY", "^SPX", "VOO"):
+        for attempt in range(2):
+            try:
+                df = yf.download(symbol, start=start_date, end=end_date,
+                                 progress=False, auto_adjust=True)
+                if df is None or df.empty or "Close" not in df:
+                    continue
+                close_series = df["Close"]
+                # Single-ticker downloads can come back as a 1-col DataFrame
+                if hasattr(close_series, "columns"):
+                    close_series = close_series.iloc[:, 0]
+                close_series = close_series.dropna()
+                if close_series.empty:
+                    continue
+
+                # Normalize to base 100
+                first_val = float(close_series.iloc[0])
+                if first_val == 0:
+                    continue
+                series_dict = {str(idx.date()): (float(val) / first_val * 100)
+                               for idx, val in close_series.items()}
+                _benchmark_cache[cache_key] = series_dict
+                print(f"Benchmark loaded from {symbol} ({len(series_dict)} points)")
+                return series_dict
+            except Exception as e:
+                print(f"Benchmark fetch failed for {symbol} (attempt {attempt + 1}): {e}")
+                continue
+
+    print("Benchmark: all symbols failed; S&P 500 line will be empty.")
+    _benchmark_cache[cache_key] = {}
+    return {}
 
 def get_historical_prices(tickers: list[str], start_date: str, end_date: str, source_map: dict = None) -> dict[str, pd.Series]:
     if source_map is None:

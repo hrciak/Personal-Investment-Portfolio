@@ -2,6 +2,10 @@
 broker-statements/*
 !broker-statements/.gitkeep
 
+# Generated diagnostics reports (may list your holdings)
+diagnostics-report-*.md
+diagnostics-report-*.json
+
 # Python cache & compiled files
 __pycache__/
 *.pyc
