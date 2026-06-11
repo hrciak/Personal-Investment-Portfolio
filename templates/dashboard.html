@@ -158,6 +158,12 @@
 
     /* CHARTS */
     .charts-row { display: grid; grid-template-columns: 65% 1fr; gap: 16px; margin-bottom: 24px; }
+    .chart-hero { margin-bottom: 24px; }
+    .chart-hero canvas { max-height: 340px; }
+    .holdings-row {
+      display: grid; grid-template-columns: minmax(0, 1fr) 320px;
+      gap: 16px; margin-bottom: 24px; align-items: start;
+    }
     .chart-box {
       background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px;
       transition: all 0.2s ease;
@@ -250,6 +256,7 @@
 
     @media (max-width: 768px) {
       .charts-row { grid-template-columns: 1fr; }
+      .holdings-row { grid-template-columns: 1fr; }
       .header { flex-direction: column; gap: 12px; }
       .kpi-row { grid-template-columns: repeat(2, 1fr); }
     }
@@ -393,7 +400,13 @@
         </div>
     {% else %}
 
-    <!-- PERFORMANCE KPIs -->
+    <!-- PORTFOLIO PERFORMANCE (hero) -->
+    <div class="section-label" style="margin-top: 8px;">Portfolio Performance</div>
+    <div class="chart-box chart-hero">
+      <canvas id="nwChart" height="320"></canvas>
+    </div>
+
+    <!-- HEADLINE KPIs -->
     <div class="section-label">Performance Overview</div>
     <div class="kpi-row">
       <div class="kpi-card">
@@ -430,6 +443,58 @@
         <div class="kpi-label">Dividend Income</div>
         <div class="kpi-val gold">{{ fmt_eur(kpis.dividend_income) }}</div>
         <div class="kpi-sub">Gross received</div>
+      </div>
+    </div>
+
+    <!-- HOLDINGS & ALLOCATION -->
+    <div class="section-label">Holdings &amp; Allocation</div>
+    <div class="holdings-row">
+      <div class="table-wrap">
+        <table id="tbl-pos">
+          <thead>
+            <tr>
+              <th onclick="sortTable('tbl-pos', 0, false)">Ticker</th>
+              <th onclick="sortTable('tbl-pos', 1, false)">Class</th>
+              <th onclick="sortTable('tbl-pos', 2, false)">Source</th>
+              <th onclick="sortTable('tbl-pos', 3, true)">Weight</th>
+              <th onclick="sortTable('tbl-pos', 4, true)">Qty</th>
+              <th onclick="sortTable('tbl-pos', 5, true)">Avg Cost</th>
+              <th onclick="sortTable('tbl-pos', 6, true)">Live Price</th>
+              <th onclick="sortTable('tbl-pos', 7, true)">Mkt Value</th>
+              <th onclick="sortTable('tbl-pos', 8, true)">Unr. PnL €</th>
+              <th onclick="sortTable('tbl-pos', 9, true)">Unr. PnL %</th>
+              <th onclick="sortTable('tbl-pos', 10, true)">Real. PnL €</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for p in positions %}
+            <tr>
+              <td style="font-family: 'DM Sans', sans-serif; font-weight:600; font-size:13px">{{ p.ticker }}</td>
+              <td>
+                {% if p.asset_class == 'Crypto' %}<span class="class-pill class-crypto">Crypto</span>
+                {% elif p.asset_class == 'Stock/ETF' %}<span class="class-pill class-stock">Stock/ETF</span>
+                {% else %}<span class="class-pill class-cash">Cash</span>{% endif %}
+              </td>
+              <td><span class="source-pill {{ source_cls(p.source) }}">{{ p.source }}</span></td>
+              <td>
+                <span class="weight-bar"><span class="weight-fill" style="width: {{ p.weight_pct }}%"></span></span>
+                <span class="mono" style="font-size:11px">{{ "{:.1f}".format(p.weight_pct) }}%</span>
+              </td>
+              <td>{{ format_qty(p.qty, p.asset_class == 'Crypto') }}</td>
+              <td>{{ fmt_eur(p.avg_cost) }}</td>
+              <td>{{ fmt_eur(p.price) }}</td>
+              <td>{{ fmt_eur(p.market_value) }}</td>
+              <td class="cell-pnl {{ color_cls(p.unrealized_pnl) }}">{{ fmt_eur(p.unrealized_pnl) }}</td>
+              <td class="cell-pnl {{ color_cls(p.unrealized_pnl_pct) }}">{{ fmt_pct(p.unrealized_pnl_pct) }}</td>
+              <td class=" {{ color_cls(p.realized_pnl) }}">{{ fmt_eur(p.realized_pnl) }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="chart-box">
+        <div class="chart-title">Asset Allocation</div>
+        <div style="height: 280px;"><canvas id="allocChart"></canvas></div>
       </div>
     </div>
 
@@ -537,65 +602,6 @@
       {% endfor %}
     </div>
     {% endif %}
-
-    <!-- CHARTS ROW -->
-    <div class="section-label">Charts</div>
-    <div class="charts-row">
-      <div class="chart-box">
-        <div class="chart-title">Net Worth Timeline</div>
-        <canvas id="nwChart" height="250"></canvas>
-      </div>
-      <div class="chart-box">
-        <div class="chart-title">Asset Allocation</div>
-        <canvas id="allocChart" height="250"></canvas>
-      </div>
-    </div>
-
-    <!-- POSITIONS TABLE -->
-    <div class="section-title">Open Positions</div>
-    <div class="table-wrap">
-      <table id="tbl-pos">
-        <thead>
-          <tr>
-            <th onclick="sortTable('tbl-pos', 0, false)">Ticker</th>
-            <th onclick="sortTable('tbl-pos', 1, false)">Class</th>
-            <th onclick="sortTable('tbl-pos', 2, false)">Source</th>
-            <th onclick="sortTable('tbl-pos', 3, true)">Weight</th>
-            <th onclick="sortTable('tbl-pos', 4, true)">Qty</th>
-            <th onclick="sortTable('tbl-pos', 5, true)">Avg Cost</th>
-            <th onclick="sortTable('tbl-pos', 6, true)">Live Price</th>
-            <th onclick="sortTable('tbl-pos', 7, true)">Mkt Value</th>
-            <th onclick="sortTable('tbl-pos', 8, true)">Unr. PnL €</th>
-            <th onclick="sortTable('tbl-pos', 9, true)">Unr. PnL %</th>
-            <th onclick="sortTable('tbl-pos', 10, true)">Real. PnL €</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for p in positions %}
-          <tr>
-            <td style="font-family: 'DM Sans', sans-serif; font-weight:600; font-size:13px">{{ p.ticker }}</td>
-            <td>
-              {% if p.asset_class == 'Crypto' %}<span class="class-pill class-crypto">Crypto</span>
-              {% elif p.asset_class == 'Stock/ETF' %}<span class="class-pill class-stock">Stock/ETF</span>
-              {% else %}<span class="class-pill class-cash">Cash</span>{% endif %}
-            </td>
-            <td><span class="source-pill {{ source_cls(p.source) }}">{{ p.source }}</span></td>
-            <td>
-              <span class="weight-bar"><span class="weight-fill" style="width: {{ p.weight_pct }}%"></span></span>
-              <span class="mono" style="font-size:11px">{{ "{:.1f}".format(p.weight_pct) }}%</span>
-            </td>
-            <td>{{ format_qty(p.qty, p.asset_class == 'Crypto') }}</td>
-            <td>{{ fmt_eur(p.avg_cost) }}</td>
-            <td>{{ fmt_eur(p.price) }}</td>
-            <td>{{ fmt_eur(p.market_value) }}</td>
-            <td class="cell-pnl {{ color_cls(p.unrealized_pnl) }}">{{ fmt_eur(p.unrealized_pnl) }}</td>
-            <td class="cell-pnl {{ color_cls(p.unrealized_pnl_pct) }}">{{ fmt_pct(p.unrealized_pnl_pct) }}</td>
-            <td class=" {{ color_cls(p.realized_pnl) }}">{{ fmt_eur(p.realized_pnl) }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
 
     <!-- DIVIDENDS TABLE -->
     {% if dividends %}

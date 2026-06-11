@@ -1,5 +1,4 @@
 import os
-import glob
 from datetime import datetime
 from flask import Flask, render_template, jsonify
 
@@ -29,7 +28,12 @@ def load_all_transactions():
         os.makedirs(TX_DIR)
         return transactions
 
-    for filepath in glob.glob(os.path.join(TX_DIR, "*")):
+    # os.listdir instead of glob: glob treats [ ] in the directory path as
+    # pattern syntax and silently matches nothing
+    for filename in sorted(os.listdir(TX_DIR)):
+        filepath = os.path.join(TX_DIR, filename)
+        if not os.path.isfile(filepath):
+            continue
         # Skip hidden files
         if os.path.basename(filepath).startswith("."):
             continue
@@ -167,4 +171,4 @@ def get_data():
     return jsonify(cached_data)
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5050)

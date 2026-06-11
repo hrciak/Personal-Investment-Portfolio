@@ -1,20 +1,27 @@
 """
 eToro Account Statement Parser
+==============================
 
-Supports eToro XLSX exports (Account Statement) which typically contain sheets:
-  - "Closed Positions" — completed trades with P/L
-  - "Transactions Report" — deposits, withdrawals, dividends, fees, adjustments
-  - "Account Activity" — alternative format for some exports
-  - "Financial Summary" — summary data (like the screenshot)
+eToro exports an XLSX "Account Statement" workbook. The sheet and column names
+are localized to the account's language. This parser supports both English and
+Czech exports (the two formats seen in practice) and is structured so more
+locales can be added by extending the keyword tables below.
 
-Also supports eToro CSV exports from Portfolio → History.
+eToro accounts are denominated in USD, but the statement already provides EUR
+figures for the values that matter (realized profit per closed position, and
+the original EUR amount inside deposit descriptions). We use those EUR figures
+directly and only fall back to an FX conversion for USD-only amounts. The FX
+rate is derived from the statement itself (EUR shown in a deposit vs. its USD
+amount) so it reflects the real period rate, with a live rate as a last resort.
 
-eToro operates primarily in USD. Conversion to EUR uses:
-  1. The "Amount" column in EUR if present
-  2. ECB exchange rate at transaction date (fetched once)
-  3. Fallback fixed rate
+Sheets consumed:
+  - Closed Positions  / "Zavřené pozice"      -> BUY+SELL legs, EUR realized P/L
+  - Open Positions    / "Otevřené pozice"     -> BUY legs for current holdings
+  - Account Activity  / "Aktivita na účtu"    -> deposits, withdrawals, dividends
+  - Dividends         / "Dividendy"           -> dividends + withholding tax
 """
 
+import re
 import openpyxl
 import pandas as pd
 import io
@@ -24,528 +31,480 @@ from datetime import datetime
 from parsers.base import create_transaction
 
 
-# --- USD/EUR conversion ---
+# --------------------------------------------------------------------------
+# Localized sheet-name and column keywords (lowercased substrings)
+# --------------------------------------------------------------------------
 
-_ecb_rate_cache = {}
+SHEET_KEYWORDS = {
+    "closed":   ["closed positions", "zavřené pozice", "zavrene pozice"],
+    "open":     ["open positions", "otevřené pozice", "otevrene pozice"],
+    "activity": ["account activity", "aktivita na účtu", "aktivita na uctu"],
+    "dividend": ["dividends", "dividendy"],
+}
 
-def _get_usd_eur_rate(date_str: str = None) -> float:
-    """Get USD→EUR conversion rate. Uses ECB API with caching."""
-    global _ecb_rate_cache
-    
-    if date_str and date_str in _ecb_rate_cache:
-        return _ecb_rate_cache[date_str]
-    
-    try:
-        # Fetch latest rate from ECB
-        resp = requests.get(
-            "https://api.frankfurter.app/latest?from=USD&to=EUR",
-            timeout=5
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            rate = data.get("rates", {}).get("EUR", 0.855)
-            _ecb_rate_cache["latest"] = rate
-            if date_str:
-                _ecb_rate_cache[date_str] = rate
-            return rate
-    except Exception:
-        pass
-    
-    # Fallback rate (approximate)
-    return _ecb_rate_cache.get("latest", 0.855)
+# Detection: any of these sheet substrings marks the workbook as eToro
+ETORO_SHEET_INDICATORS = [
+    "closed positions", "financial summary", "transactions report",
+    "account activity", "account details",
+    "zavřené pozice", "zavrene pozice", "aktivita na účtu", "aktivita na uctu",
+    "finanční shrnutí", "financni shrnuti", "přehled účtu", "prehled uctu",
+    "dividendy",
+]
+
+# Column resolvers: canonical key -> list of possible header substrings (lower)
+COLS = {
+    "action":      ["action", "akce"],
+    "amount":      ["částka", "castka", "amount"],
+    "units":       ["jednotky", "units"],
+    "open_date":   ["datum otevření", "datum otevreni", "open date"],
+    "close_date":  ["datum uzavření", "datum uzavreni", "close date"],
+    "open_rate":   ["otevírací kurz", "oteviraci kurz", "open rate"],
+    "close_rate":  ["uzavírací kurz", "uzaviraci kurz", "close rate"],
+    "profit_eur":  ["zisk (eur)", "profit (eur)", "zisk eur"],
+    "profit_usd":  ["zisk (usd)", "profit (usd)", "zisk usd"],
+    "position_id": ["id pozice", "position id"],
+    "isin":        ["isin"],
+    "asset_type":  ["typ aktiva", "napište", "napiste", "type"],
+    "date":        ["datum", "date"],
+    "row_type":    ["napište", "napiste", "type"],
+    "details":     ["podrobnosti", "details"],
+    "current_rate": ["aktuální kurz", "aktualni kurz", "current rate", "market rate"],
+    # Dividends sheet
+    "div_date":    ["datum platby", "payment date"],
+    "div_instrument": ["název nástroje", "nazev nastroje", "instrument name", "instrument"],
+    "div_net_eur": ["čistá přijatá dividenda v (eur)", "net dividend received (eur)"],
+    "div_net":     ["net dividends", "čistá přijatá dividenda", "cista prijata dividenda"],
+    "div_currency": ["currency", "měna", "mena"],
+    "div_wht":     ["částka srážkové daně", "castka srazkove dane", "withholding tax amount"],
+}
+
+# Activity row-type keywords (lowercased substrings of the "type" cell)
+ACT_DEPOSIT    = ["deposit", "vklad"]
+ACT_WITHDRAWAL = ["withdraw", "výběr", "vyber"]
+ACT_DIVIDEND   = ["dividend", "dividenda"]
+# Rows handled elsewhere (positions sheets) or not modeled — skipped in activity
+# so they aren't misread as deposits/withdrawals. Checked before the rules above,
+# which matters because e.g. "Poplatek za směnu měny při vkladu" contains "vklad".
+ACT_SKIP = ["poplatek", "fee", "provize", "commission", "úprava", "uprava",
+            "adjustment", "otevřená pozice", "otevrena pozice", "open position",
+            "zisk/ztráta", "zisk/ztrata", "profit/loss", "rollover", "overnight"]
 
 
-def _usd_to_eur(amount_usd: float, rate: float = None) -> float:
-    """Convert USD to EUR."""
-    if rate is None:
-        rate = _get_usd_eur_rate()
-    return amount_usd * rate
-
-
-# --- XLSX Parser (Account Statement export) ---
-
-def _find_header_row(sheet, required_headers: list[str]) -> int:
-    """Finds the 1-based index of the header row in a sheet."""
-    for row_idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-        if not row:
-            continue
-        row_strs = [str(cell).strip().lower() for cell in row if cell is not None]
-        if all(any(req.lower() in cell_str for cell_str in row_strs) for req in required_headers):
-            return row_idx
-    return -1
-
-
-def _extract_rows(sheet, header_row_idx: int) -> list[dict]:
-    """Extract rows as list of dicts from a sheet starting at header row."""
-    rows = list(sheet.iter_rows(values_only=True))
-    header = [str(c).strip() if c is not None else "" for c in rows[header_row_idx - 1]]
-    
-    data = []
-    for row in rows[header_row_idx:]:
-        if not any(row):
-            continue
-        row_dict = {}
-        for col_idx, col_name in enumerate(header):
-            if col_idx < len(row):
-                row_dict[col_name] = row[col_idx]
-        data.append(row_dict)
-    return data
-
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
 
 def _safe_float(val, default=0.0) -> float:
-    """Safely convert a value to float."""
     if val is None or val == "" or val == "-" or val == "N/A":
         return default
     try:
-        # Handle parentheses for negative numbers: (2.70) -> -2.70
         s = str(val).strip()
         if s.startswith("(") and s.endswith(")"):
             return -float(s[1:-1].replace(",", ""))
-        return float(s.replace(",", "").replace("$", "").replace("€", ""))
+        return float(s.replace(",", "").replace("$", "").replace("€", "").replace("%", ""))
     except (ValueError, TypeError):
         return default
 
 
 def _parse_etoro_date(val) -> datetime:
-    """Parse eToro date from various formats."""
     if isinstance(val, datetime):
         return val
     if isinstance(val, pd.Timestamp):
         return val.to_pydatetime()
-    
     s = str(val).strip()
-    for fmt in [
-        "%d/%m/%Y %H:%M:%S",
-        "%d/%m/%Y %H:%M",
-        "%d/%m/%Y",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-        "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%Y",
-    ]:
+    for fmt in ["%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y"]:
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
             continue
-    
-    # Fallback to pandas
     try:
-        return pd.to_datetime(s).to_pydatetime()
+        return pd.to_datetime(s, dayfirst=True).to_pydatetime()
     except Exception:
         return datetime.now()
 
 
-def _strip_etoro_ticker(instrument: str) -> str:
-    """Extract a clean ticker from eToro instrument names.
-    
-    eToro uses full names like 'Apple', 'Bitcoin', 'NVIDIA Corporation'
-    and sometimes tickers like 'AAPL', 'BTC'.
+def _extract_ticker(instrument: str) -> str:
+    """Pull a ticker from an eToro instrument label.
+
+    eToro labels look like 'Taiwan Semiconductor ... - ADR (TSM)' or 'BTC/USD'
+    or just 'Apple'. Prefer an explicit ticker in parentheses, then a SYM/CCY
+    pair, then a short alnum token, else the first word.
     """
     if not instrument:
         return "UNKNOWN"
-    
-    # Common eToro instrument name → ticker mapping
-    name_map = {
-        "apple": "AAPL", "microsoft": "MSFT", "amazon": "AMZN",
-        "google": "GOOGL", "alphabet": "GOOGL", "meta": "META",
-        "facebook": "META", "nvidia": "NVDA", "tesla": "TSLA",
-        "netflix": "NFLX", "amd": "AMD", "intel": "INTC",
-        "disney": "DIS", "coca-cola": "KO", "coca cola": "KO",
-        "pepsi": "PEP", "pepsico": "PEP", "walmart": "WMT",
-        "johnson": "JNJ", "procter": "PG", "visa": "V",
-        "mastercard": "MA", "paypal": "PYPL", "adobe": "ADBE",
-        "salesforce": "CRM", "uber": "UBER", "airbnb": "ABNB",
-        "palantir": "PLTR", "coinbase": "COIN", "shopify": "SHOP",
-        "spotify": "SPOT", "snap": "SNAP", "twitter": "X",
-        "zoom": "ZM", "square": "SQ", "block": "SQ",
-        "bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL",
-        "cardano": "ADA", "ripple": "XRP", "xrp": "XRP",
-        "polkadot": "DOT", "dogecoin": "DOGE", "litecoin": "LTC",
-        "chainlink": "LINK", "avalanche": "AVAX", "polygon": "MATIC",
-        "uniswap": "UNI", "aave": "AAVE", "cosmos": "ATOM",
-        "near protocol": "NEAR", "fantom": "FTM",
-        "s&p 500": "SPY", "spdr": "SPY",
-        "vanguard s&p": "VOO", "ishares": "IVV",
-    }
-    
-    instrument_lower = instrument.strip().lower()
-    
-    # Check direct name match
-    for name, ticker in name_map.items():
-        if name in instrument_lower:
-            return ticker
-    
-    # If it looks like a ticker already (short, uppercase-ish)
-    clean = instrument.strip().split("/")[0].strip()
-    if len(clean) <= 6 and clean.replace(".", "").replace("-", "").isalnum():
-        return clean.upper()
-    
-    # Fallback: take first word, uppercase
-    return instrument.strip().split()[0].upper() if instrument.strip() else "UNKNOWN"
+    s = str(instrument).strip()
+
+    # 1) Ticker in parentheses, e.g. "(TSM)" or "(BRK.B)"
+    m = re.search(r"\(([A-Za-z0-9.\-]{1,8})\)\s*$", s)
+    if m:
+        return m.group(1).upper()
+
+    # 2) "SYM/CCY" pair, e.g. "TSM/USD" or "BTC/USD"
+    if "/" in s:
+        left = s.split("/")[0].strip()
+        if 1 <= len(left) <= 8 and left.replace(".", "").replace("-", "").isalnum():
+            return left.upper()
+
+    # 3) Already a short ticker-ish token
+    if len(s) <= 6 and s.replace(".", "").replace("-", "").isalnum():
+        return s.upper()
+
+    # 4) First word fallback
+    return s.split()[0].upper() if s.split() else "UNKNOWN"
 
 
-def _parse_closed_positions(sheet, eur_rate: float) -> list[dict]:
-    """Parse eToro 'Closed Positions' sheet."""
-    transactions = []
-    
-    # Try different header combinations
-    hdr_idx = _find_header_row(sheet, ["Action", "Amount"])
-    if hdr_idx == -1:
-        hdr_idx = _find_header_row(sheet, ["Position ID", "Profit"])
-    if hdr_idx == -1:
-        return transactions
-    
-    rows = _extract_rows(sheet, hdr_idx)
-    
-    for r in rows:
-        # Extract fields — eToro closed positions vary in column naming
-        instrument = str(r.get("Action", r.get("Instrument", r.get("Asset", ""))))
-        pos_id = str(r.get("Position ID", r.get("Position", "")))
-        
-        # Amount is total position value at open
-        amount = _safe_float(r.get("Amount", r.get("Invested", 0)))
-        units = _safe_float(r.get("Units", r.get("Qty", 0)))
-        open_rate = _safe_float(r.get("Open Rate", r.get("Open Price", 0)))
-        close_rate = _safe_float(r.get("Close Rate", r.get("Close Price", 0)))
-        profit = _safe_float(r.get("Profit", r.get("P/L", r.get("Net Profit", 0))))
-        
-        # Dates
-        open_date_raw = r.get("Open Date", r.get("Open Time", None))
-        close_date_raw = r.get("Close Date", r.get("Close Time", None))
-        
-        if not open_date_raw or not instrument:
+# --------------------------------------------------------------------------
+# Sheet / header / column resolution
+# --------------------------------------------------------------------------
+
+def _find_sheet(wb, key):
+    wanted = SHEET_KEYWORDS[key]
+    for sn in wb.sheetnames:
+        low = sn.strip().lower()
+        if any(w in low for w in wanted):
+            return wb[sn]
+    return None
+
+
+def _find_header_row(sheet, required_keys, max_scan=15):
+    """Find the 1-based header row by requiring that every key in required_keys
+    matches at least one cell. Returns (row_idx, header_list) or (-1, None)."""
+    rows = list(sheet.iter_rows(values_only=True))
+    for idx, row in enumerate(rows[:max_scan], start=1):
+        if not row:
             continue
-        
+        cells = [str(c).strip().lower() if c is not None else "" for c in row]
+        ok = True
+        for key in required_keys:
+            variants = COLS[key]
+            if not any(any(v in cell for v in variants) for cell in cells):
+                ok = False
+                break
+        if ok:
+            header = [str(c).strip() if c is not None else "" for c in row]
+            return idx, header
+    return -1, None
+
+
+def _rows_as_dicts(sheet, header_row_idx, header):
+    rows = list(sheet.iter_rows(values_only=True))
+    out = []
+    for row in rows[header_row_idx:]:
+        if not any(c not in (None, "") for c in row):
+            continue
+        d = {}
+        for i, name in enumerate(header):
+            if i < len(row):
+                d[name] = row[i]
+        out.append(d)
+    return out
+
+
+def _get(row_dict, key, default=None):
+    """Get a value from a row dict by canonical column key (fuzzy header match)."""
+    variants = COLS[key]
+    for header, val in row_dict.items():
+        hl = str(header).strip().lower()
+        if any(v in hl for v in variants):
+            return val
+    return default
+
+
+# --------------------------------------------------------------------------
+# FX rate (USD -> EUR), derived from the statement when possible
+# --------------------------------------------------------------------------
+
+_live_rate_cache = {}
+
+def _live_usd_eur() -> float:
+    if "rate" in _live_rate_cache:
+        return _live_rate_cache["rate"]
+    try:
+        resp = requests.get("https://api.frankfurter.app/latest?from=USD&to=EUR", timeout=5)
+        if resp.status_code == 200:
+            rate = resp.json().get("rates", {}).get("EUR", 0.92)
+            _live_rate_cache["rate"] = rate
+            return rate
+    except Exception:
+        pass
+    _live_rate_cache["rate"] = 0.92
+    return 0.92
+
+
+def _derive_statement_rate(activity_rows) -> float:
+    """Derive USD->EUR from a deposit whose details name an EUR amount.
+    e.g. details '180.00 EUR CreditCard' with USD amount 208.13 -> 0.8648."""
+    rates = []
+    for r in activity_rows:
+        rtype = str(_get(r, "row_type", "")).lower()
+        if any(k in rtype for k in ACT_SKIP):
+            continue
+        if not any(k in rtype for k in ACT_DEPOSIT):
+            continue
+        details = str(_get(r, "details", "") or "")
+        m = re.search(r"([\d.,]+)\s*EUR", details, re.IGNORECASE)
+        usd = _safe_float(_get(r, "amount", 0))
+        if m and usd > 0:
+            eur = _safe_float(m.group(1))
+            if eur > 0:
+                rates.append(eur / usd)
+    if rates:
+        rates.sort()
+        return rates[len(rates) // 2]  # median
+    return _live_usd_eur()
+
+
+# --------------------------------------------------------------------------
+# Sheet parsers
+# --------------------------------------------------------------------------
+
+def _parse_closed(sheet, rate) -> list:
+    txs = []
+    idx, header = _find_header_row(sheet, ["action", "amount"])
+    if idx == -1:
+        idx, header = _find_header_row(sheet, ["position_id", "profit_eur"])
+    if idx == -1:
+        return txs
+    for r in _rows_as_dicts(sheet, idx, header):
+        instrument = str(_get(r, "action", "") or "")
+        if not instrument or instrument.lower() in ("none", "nan", ""):
+            continue
+        open_date_raw = _get(r, "open_date")
+        if not open_date_raw:
+            continue
+        ticker = _extract_ticker(instrument)
+        units = _safe_float(_get(r, "units"))
+        amount_usd = _safe_float(_get(r, "amount"))
+        open_rate_usd = _safe_float(_get(r, "open_rate"))
+        close_rate_usd = _safe_float(_get(r, "close_rate"))
+        profit_eur = _get(r, "profit_eur")
+        profit_eur = _safe_float(profit_eur) if profit_eur not in (None, "", "-") else _safe_float(_get(r, "profit_usd")) * rate
+        pos_id = str(_get(r, "position_id", "") or "")
+
+        if units == 0 and open_rate_usd > 0:
+            units = amount_usd / open_rate_usd
+
         open_date = _parse_etoro_date(open_date_raw)
-        close_date = _parse_etoro_date(close_date_raw) if close_date_raw else open_date
-        
-        ticker = _strip_etoro_ticker(instrument)
-        
-        # If no units, derive from amount and open rate
+        close_raw = _get(r, "close_date")
+        close_date = _parse_etoro_date(close_raw) if close_raw else open_date
+
+        # Prices to EUR (rates are USD on the instrument)
+        open_price_eur = open_rate_usd * rate
+        close_price_eur = close_rate_usd * rate
+
+        txs.append(create_transaction(
+            date=open_date, ticker=ticker, tx_type="BUY", qty=units,
+            price=open_price_eur, fee=0.0, position_id=pos_id, source="eToro"))
+        txs.append(create_transaction(
+            date=close_date, ticker=ticker, tx_type="SELL", qty=units,
+            price=close_price_eur, fee=0.0, realized_pnl=profit_eur,
+            position_id=pos_id, source="eToro"))
+    return txs
+
+
+def _parse_open(sheet, rate) -> list:
+    txs = []
+    idx, header = _find_header_row(sheet, ["action", "units"])
+    if idx == -1:
+        idx, header = _find_header_row(sheet, ["position_id", "open_rate"])
+    if idx == -1:
+        return txs
+    for r in _rows_as_dicts(sheet, idx, header):
+        instrument = str(_get(r, "action", "") or "")
+        if not instrument or instrument.lower() in ("none", "nan", ""):
+            continue
+        open_date_raw = _get(r, "open_date")
+        if not open_date_raw:
+            continue
+        ticker = _extract_ticker(instrument)
+        units = _safe_float(_get(r, "units"))
+        amount_usd = _safe_float(_get(r, "amount"))
+        open_rate_usd = _safe_float(_get(r, "open_rate"))
+        cur_rate_usd = _safe_float(_get(r, "current_rate"))
+        pos_id = str(_get(r, "position_id", "") or "")
+        if units == 0 and open_rate_usd > 0:
+            units = amount_usd / open_rate_usd
+        market_eur = (cur_rate_usd * rate) if cur_rate_usd > 0 else None
+        txs.append(create_transaction(
+            date=_parse_etoro_date(open_date_raw), ticker=ticker, tx_type="BUY",
+            qty=units, price=open_rate_usd * rate, fee=0.0,
+            market_price_at_export=market_eur, position_id=pos_id, source="eToro"))
+    return txs
+
+
+def _parse_activity(sheet, rate, activity_rows) -> list:
+    """Deposits, withdrawals and dividends from the Account Activity ledger.
+    Trade rows are intentionally ignored here (handled by the positions sheets)."""
+    txs = []
+    for r in activity_rows:
+        date_raw = _get(r, "date")
+        if not date_raw:
+            continue
+        dt = _parse_etoro_date(date_raw)
+        rtype = str(_get(r, "row_type", "") or "").lower()
+        amount_usd = _safe_float(_get(r, "amount"))
+        details = str(_get(r, "details", "") or "")
+
+        if any(k in rtype for k in ACT_SKIP):
+            continue
+        if any(k in rtype for k in ACT_DEPOSIT):
+            m = re.search(r"([\d.,]+)\s*EUR", details, re.IGNORECASE)
+            eur = _safe_float(m.group(1)) if m else abs(amount_usd) * rate
+            txs.append(create_transaction(dt, "CASH", "DEPOSIT", eur, 1.0, source="eToro"))
+        elif any(k in rtype for k in ACT_WITHDRAWAL):
+            m = re.search(r"([\d.,]+)\s*EUR", details, re.IGNORECASE)
+            eur = _safe_float(m.group(1)) if m else abs(amount_usd) * rate
+            txs.append(create_transaction(dt, "CASH", "WITHDRAWAL", eur, 1.0, source="eToro"))
+        elif any(k in rtype for k in ACT_DIVIDEND):
+            ticker = _extract_ticker(str(_get(r, "details", "") or "CASH"))
+            txs.append(create_transaction(dt, ticker, "DIVIDEND", abs(amount_usd) * rate, 1.0, source="eToro"))
+    return txs
+
+
+def _parse_dividends(sheet, rate) -> list:
+    txs = []
+    idx, header = _find_header_row(sheet, ["div_date", "div_instrument"])
+    if idx == -1:
+        return txs
+    for r in _rows_as_dicts(sheet, idx, header):
+        date_raw = _get(r, "div_date")
+        if not date_raw:
+            continue
+        dt = _parse_etoro_date(date_raw)
+        ticker = _extract_ticker(str(_get(r, "div_instrument", "") or ""))
+        currency = str(_get(r, "div_currency", "EUR") or "EUR").upper()
+        net_eur = _get(r, "div_net_eur")
+        if net_eur not in (None, "", "-"):
+            amount = _safe_float(net_eur)
+        else:
+            amount = _safe_float(_get(r, "div_net"))
+            if currency != "EUR":
+                amount *= rate
+        if amount > 0:
+            txs.append(create_transaction(dt, ticker, "DIVIDEND", amount, 1.0, source="eToro"))
+        wht = _safe_float(_get(r, "div_wht"))
+        if wht > 0:
+            wht_eur = wht if currency == "EUR" else wht * rate
+            txs.append(create_transaction(dt, ticker, "WITHHOLDING_TAX", wht_eur, 1.0, source="eToro"))
+    return txs
+
+
+# --------------------------------------------------------------------------
+# CSV parser (Portfolio -> History export)
+# --------------------------------------------------------------------------
+
+def _parse_etoro_csv(filepath: str) -> list:
+    rate = _live_usd_eur()
+    with open(filepath, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    start = 0
+    for i, line in enumerate(lines[:10]):
+        if any(h in line for h in ["Position ID", "Action", "Open Date", "ID pozice"]):
+            start = i
+            break
+    df = pd.read_csv(io.StringIO("".join(lines[start:])), delimiter=",", quoting=csv.QUOTE_MINIMAL)
+    df.columns = [str(c).strip() for c in df.columns]
+    txs = []
+
+    def col(row, *names):
+        for n in names:
+            for c in row.index:
+                if n.lower() in str(c).lower():
+                    return row[c]
+        return None
+
+    for _, row in df.iterrows():
+        instrument = str(col(row, "Action", "Akce", "Instrument") or "")
+        action = instrument.lower()
+        if not instrument:
+            continue
+        ticker = _extract_ticker(instrument)
+        units = _safe_float(col(row, "Units", "Jednotky"))
+        amount = _safe_float(col(row, "Amount", "Částka"))
+        open_rate = _safe_float(col(row, "Open Rate", "Otevírací"))
+        close_rate = _safe_float(col(row, "Close Rate", "Uzavírací"))
+        profit_eur = col(row, "Profit (EUR)", "Zisk (EUR)")
+        profit_eur = _safe_float(profit_eur) if profit_eur is not None else _safe_float(col(row, "Profit", "Zisk")) * rate
+        pos_id = str(col(row, "Position ID", "ID pozice") or "")
+        open_date = _parse_etoro_date(col(row, "Open Date", "Datum otevření", "Date"))
+        close_raw = col(row, "Close Date", "Datum uzavření")
+        close_date = _parse_etoro_date(close_raw) if pd.notna(close_raw) else open_date
         if units == 0 and open_rate > 0:
             units = amount / open_rate
-        
-        # Convert to EUR
-        open_price_eur = _usd_to_eur(open_rate, eur_rate)
-        close_price_eur = _usd_to_eur(close_rate, eur_rate)
-        
-        # BUY leg
-        transactions.append(create_transaction(
-            date=open_date,
-            ticker=ticker,
-            tx_type="BUY",
-            qty=units,
-            price=open_price_eur,
-            fee=0.0,
-            realized_pnl=None,
-            position_id=pos_id,
-            source="eToro",
-            currency="EUR"
-        ))
-        
-        # SELL leg
-        profit_eur = _usd_to_eur(profit, eur_rate)
-        transactions.append(create_transaction(
-            date=close_date,
-            ticker=ticker,
-            tx_type="SELL",
-            qty=units,
-            price=close_price_eur,
-            fee=0.0,
-            realized_pnl=profit_eur,
-            position_id=pos_id,
-            source="eToro",
-            currency="EUR"
-        ))
-    
-    return transactions
+        txs.append(create_transaction(open_date, ticker, "BUY", units, open_rate * rate,
+                                      fee=0.0, position_id=pos_id, source="eToro"))
+        if close_rate > 0:
+            txs.append(create_transaction(close_date, ticker, "SELL", units, close_rate * rate,
+                                          fee=0.0, realized_pnl=profit_eur, position_id=pos_id, source="eToro"))
+    return txs
 
 
-def _parse_transactions_report(sheet, eur_rate: float) -> list[dict]:
-    """Parse eToro 'Transactions Report' sheet — deposits, withdrawals, dividends, fees."""
-    transactions = []
-    
-    hdr_idx = _find_header_row(sheet, ["Date", "Type"])
-    if hdr_idx == -1:
-        hdr_idx = _find_header_row(sheet, ["Date", "Detail"])
-    if hdr_idx == -1:
-        return transactions
-    
-    rows = _extract_rows(sheet, hdr_idx)
-    
-    for r in rows:
-        date_raw = r.get("Date", r.get("Time", None))
-        if not date_raw:
-            continue
-        
-        dt = _parse_etoro_date(date_raw)
-        tx_type_raw = str(r.get("Type", r.get("Details", r.get("Detail", "")))).lower()
-        amount_usd = _safe_float(r.get("Amount", r.get("Credit", 0))) + _safe_float(r.get("Debit", 0))
-        
-        # Realized equity credit/debit
-        realized = _safe_float(r.get("Realized Equity Change", r.get("Balance", 0)))
-        
-        amount_eur = _usd_to_eur(abs(amount_usd), eur_rate) if amount_usd != 0 else _usd_to_eur(abs(realized), eur_rate)
-        
-        ticker = str(r.get("Asset", r.get("Instrument", "CASH")))
-        if not ticker or ticker in ("None", "nan", "-", ""):
-            ticker = "CASH"
-        else:
-            ticker = _strip_etoro_ticker(ticker)
-        
-        if "deposit" in tx_type_raw:
-            transactions.append(create_transaction(
-                date=dt, ticker="CASH", tx_type="DEPOSIT",
-                qty=amount_eur, price=1.0, fee=0.0, source="eToro"
-            ))
-        elif "withdraw" in tx_type_raw:
-            transactions.append(create_transaction(
-                date=dt, ticker="CASH", tx_type="WITHDRAWAL",
-                qty=amount_eur, price=1.0, fee=0.0, source="eToro"
-            ))
-        elif "dividend" in tx_type_raw:
-            transactions.append(create_transaction(
-                date=dt, ticker=ticker, tx_type="DIVIDEND",
-                qty=amount_eur, price=1.0, fee=0.0, source="eToro"
-            ))
-        elif "withholding tax" in tx_type_raw or "tax" in tx_type_raw:
-            transactions.append(create_transaction(
-                date=dt, ticker=ticker, tx_type="WITHHOLDING_TAX",
-                qty=amount_eur, price=1.0, fee=0.0, source="eToro"
-            ))
-        elif "rollover" in tx_type_raw or "overnight" in tx_type_raw:
-            # Overnight fees — treat as a fee/cost
-            if amount_usd < 0:
-                transactions.append(create_transaction(
-                    date=dt, ticker=ticker, tx_type="FEE",
-                    qty=amount_eur, price=1.0, fee=amount_eur, source="eToro"
-                ))
-        elif "adjustment" in tx_type_raw:
-            # Adjustments — treat as deposits (positive) or withdrawals (negative)
-            if amount_usd >= 0:
-                transactions.append(create_transaction(
-                    date=dt, ticker="CASH", tx_type="DEPOSIT",
-                    qty=amount_eur, price=1.0, fee=0.0, source="eToro"
-                ))
-            else:
-                transactions.append(create_transaction(
-                    date=dt, ticker="CASH", tx_type="WITHDRAWAL",
-                    qty=amount_eur, price=1.0, fee=0.0, source="eToro"
-                ))
-    
-    return transactions
+# --------------------------------------------------------------------------
+# Public entry points
+# --------------------------------------------------------------------------
+
+def _parse_etoro_xlsx(filepath: str) -> list:
+    wb = openpyxl.load_workbook(filepath, data_only=True)
+    txs = []
+
+    activity_sheet = _find_sheet(wb, "activity")
+    activity_rows = []
+    if activity_sheet:
+        idx, header = _find_header_row(activity_sheet, ["date", "amount"])
+        if idx != -1:
+            activity_rows = _rows_as_dicts(activity_sheet, idx, header)
+
+    rate = _derive_statement_rate(activity_rows)
+
+    closed = _find_sheet(wb, "closed")
+    if closed:
+        txs.extend(_parse_closed(closed, rate))
+
+    open_sheet = _find_sheet(wb, "open")
+    if open_sheet:
+        txs.extend(_parse_open(open_sheet, rate))
+
+    if activity_rows:
+        txs.extend(_parse_activity(activity_sheet, rate, activity_rows))
+
+    dividends = _find_sheet(wb, "dividend")
+    if dividends:
+        txs.extend(_parse_dividends(dividends, rate))
+
+    wb.close()
+    return txs
 
 
-def _parse_account_activity(sheet, eur_rate: float) -> list[dict]:
-    """Parse eToro 'Account Activity' sheet (alternative layout in some exports)."""
-    transactions = []
-    
-    hdr_idx = _find_header_row(sheet, ["Date", "Amount"])
-    if hdr_idx == -1:
-        return transactions
-    
-    rows = _extract_rows(sheet, hdr_idx)
-    
-    for r in rows:
-        date_raw = r.get("Date", r.get("Time", None))
-        if not date_raw:
-            continue
-        
-        dt = _parse_etoro_date(date_raw)
-        detail = str(r.get("Details", r.get("Type", r.get("Description", "")))).lower()
-        amount_usd = _safe_float(r.get("Amount", 0))
-        amount_eur = _usd_to_eur(abs(amount_usd), eur_rate)
-        
-        if "deposit" in detail:
-            transactions.append(create_transaction(
-                date=dt, ticker="CASH", tx_type="DEPOSIT",
-                qty=amount_eur, price=1.0, source="eToro"
-            ))
-        elif "withdraw" in detail:
-            transactions.append(create_transaction(
-                date=dt, ticker="CASH", tx_type="WITHDRAWAL",
-                qty=amount_eur, price=1.0, source="eToro"
-            ))
-        elif "dividend" in detail:
-            transactions.append(create_transaction(
-                date=dt, ticker="CASH", tx_type="DIVIDEND",
-                qty=amount_eur, price=1.0, source="eToro"
-            ))
-    
-    return transactions
-
-
-# --- CSV Parser ---
-
-def _parse_etoro_csv(filepath: str) -> list[dict]:
-    """Parse eToro CSV export (trade history from Portfolio → History)."""
-    eur_rate = _get_usd_eur_rate()
-    
-    with open(filepath, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-    
-    # Find the header row
-    start_idx = 0
-    for i, line in enumerate(lines[:10]):
-        if any(h in line for h in ["Position ID", "Action", "Open Date", "Amount"]):
-            start_idx = i
-            break
-    
-    csv_data = "".join(lines[start_idx:])
-    df = pd.read_csv(io.StringIO(csv_data), delimiter=',', quoting=csv.QUOTE_MINIMAL)
-    
-    transactions = []
-    
-    for _, row in df.iterrows():
-        action = str(row.get("Action", row.get("Type", ""))).lower()
-        instrument = str(row.get("Action", row.get("Instrument", row.get("Asset", ""))))
-        
-        # For trade rows
-        if any(keyword in action for keyword in ["buy", "sell"]):
-            amount = _safe_float(row.get("Amount", 0))
-            units = _safe_float(row.get("Units", 0))
-            open_rate = _safe_float(row.get("Open Rate", 0))
-            close_rate = _safe_float(row.get("Close Rate", 0))
-            profit = _safe_float(row.get("Profit", row.get("P/L", 0)))
-            pos_id = str(row.get("Position ID", ""))
-            
-            open_date = _parse_etoro_date(row.get("Open Date", row.get("Date", "")))
-            close_date_raw = row.get("Close Date", None)
-            close_date = _parse_etoro_date(close_date_raw) if pd.notna(close_date_raw) else open_date
-            
-            ticker = _strip_etoro_ticker(instrument)
-            
-            if units == 0 and open_rate > 0:
-                units = amount / open_rate
-            
-            # BUY leg
-            transactions.append(create_transaction(
-                date=open_date,
-                ticker=ticker,
-                tx_type="BUY",
-                qty=units,
-                price=_usd_to_eur(open_rate, eur_rate),
-                fee=0.0,
-                realized_pnl=None,
-                position_id=pos_id,
-                source="eToro"
-            ))
-            
-            # SELL leg (if closed)
-            if close_rate > 0:
-                transactions.append(create_transaction(
-                    date=close_date,
-                    ticker=ticker,
-                    tx_type="SELL",
-                    qty=units,
-                    price=_usd_to_eur(close_rate, eur_rate),
-                    fee=0.0,
-                    realized_pnl=_usd_to_eur(profit, eur_rate),
-                    position_id=pos_id,
-                    source="eToro"
-                ))
-    
-    return transactions
-
-
-# --- Main entry point ---
-
-def parse_etoro(filepath: str) -> list[dict]:
-    """Parse an eToro export file (XLSX or CSV).
-    
-    Supports:
-    - XLSX Account Statement (multi-sheet with Closed Positions, Transactions Report, etc.)
-    - CSV trade history export
-    """
+def parse_etoro(filepath: str) -> list:
+    """Parse an eToro export (XLSX Account Statement or CSV history)."""
     ext = filepath.rsplit(".", 1)[-1].lower()
-    eur_rate = _get_usd_eur_rate()
-    
     if ext in ("xlsx", "xls"):
-        return _parse_etoro_xlsx(filepath, eur_rate)
+        return _parse_etoro_xlsx(filepath)
     elif ext == "csv":
         return _parse_etoro_csv(filepath)
-    else:
-        print(f"eToro parser: unsupported file extension .{ext}")
-        return []
-
-
-def _parse_etoro_xlsx(filepath: str, eur_rate: float) -> list[dict]:
-    """Parse eToro XLSX Account Statement."""
-    wb = openpyxl.load_workbook(filepath, data_only=True)
-    transactions = []
-    
-    sheet_names_lower = {sn.lower(): sn for sn in wb.sheetnames}
-    
-    # 1. Closed Positions
-    closed_sheet = None
-    for key in ["closed positions", "closedpositions"]:
-        if key in sheet_names_lower:
-            closed_sheet = wb[sheet_names_lower[key]]
-            break
-    
-    if closed_sheet:
-        transactions.extend(_parse_closed_positions(closed_sheet, eur_rate))
-    
-    # 2. Transactions Report
-    tx_sheet = None
-    for key in ["transactions report", "transactionsreport", "transaction report"]:
-        if key in sheet_names_lower:
-            tx_sheet = wb[sheet_names_lower[key]]
-            break
-    
-    if tx_sheet:
-        transactions.extend(_parse_transactions_report(tx_sheet, eur_rate))
-    
-    # 3. Account Activity (fallback)
-    activity_sheet = None
-    for key in ["account activity", "accountactivity", "activity"]:
-        if key in sheet_names_lower:
-            activity_sheet = wb[sheet_names_lower[key]]
-            break
-    
-    if activity_sheet and not tx_sheet:
-        # Only use activity if no transactions report found
-        transactions.extend(_parse_account_activity(activity_sheet, eur_rate))
-    
-    return transactions
+    print(f"eToro parser: unsupported extension .{ext}")
+    return []
 
 
 def is_etoro_file(filepath: str) -> bool:
-    """Detect if a file is an eToro export.
-    
-    For XLSX: Check for characteristic sheet names.
-    For CSV: Check for eToro-specific column headers.
-    """
+    """Detect an eToro export by characteristic (localized) sheet/column names."""
     ext = filepath.rsplit(".", 1)[-1].lower()
-    
     if ext in ("xlsx", "xls"):
         try:
             wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
-            sheet_names_lower = [sn.lower() for sn in wb.sheetnames]
+            names = [sn.lower() for sn in wb.sheetnames]
             wb.close()
-            
-            etoro_indicators = [
-                "closed positions", "financial summary",
-                "transactions report", "account activity",
-                "account details"
-            ]
-            return any(ind in sn for sn in sheet_names_lower for ind in etoro_indicators)
+            return any(ind in sn for sn in names for ind in ETORO_SHEET_INDICATORS)
         except Exception:
             return False
-    
     elif ext == "csv":
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
+            with open(filepath, "r", encoding="utf-8") as f:
                 sample = f.read(2048)
-            
-            # eToro CSV signatures
-            etoro_signatures = [
-                "Position ID" in sample and "Open Rate" in sample,
-                "Position ID" in sample and "Close Rate" in sample,
-                "eToro" in sample,
-            ]
-            return any(etoro_signatures)
+            return (("Position ID" in sample and "Open Rate" in sample)
+                    or ("ID pozice" in sample and "Otevírací" in sample)
+                    or "eToro" in sample)
         except Exception:
             return False
-    
     return False
