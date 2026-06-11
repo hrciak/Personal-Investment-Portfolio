@@ -10,6 +10,7 @@ __pycache__/
 .Python
 env/
 venv/
+venv_win/
 ENV/
 .env
 .venv
