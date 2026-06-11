@@ -1,0 +1,20 @@
+# Broker Statements (Sensitive financial files)
+broker-statements/*
+!broker-statements/.gitkeep
+
+# Python cache & compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+.env
+.venv
+
+# OS files & IDEs
+.DS_Store
+Thumbs.db
+.vscode/

@@ -30,9 +30,13 @@ def compute_portfolio(transactions: list[dict]) -> dict:
     dividend_income = 0.0
     withholding_tax = 0.0
     total_invested_gross = 0.0
+    total_fees = 0.0
     
     cash_flows = []
     dividends_per_ticker = {}
+    
+    # Track per-source metrics
+    source_metrics = {}
     
     for _, row in df.iterrows():
         dt = row["date"]
@@ -45,6 +49,12 @@ def compute_portfolio(transactions: list[dict]) -> dict:
         
         cost = (qty * price) + fee if pd.notna(price) else 0.0
         proceeds = (qty * price) - fee if pd.notna(price) else 0.0
+        total_fees += fee
+        
+        # Track source metrics
+        src = row.get("source", "Unknown")
+        if src not in source_metrics:
+            source_metrics[src] = {"invested": 0.0, "realized_pnl": 0.0, "fees": 0.0, "dividends": 0.0}
         
         if tx_type == "DEPOSIT":
             cash_balance += qty * price
@@ -71,6 +81,8 @@ def compute_portfolio(transactions: list[dict]) -> dict:
                 p["total_bought_value"] += cost
                 p["running_cost_basis"] += cost
                 total_invested_gross += cost
+                source_metrics[src]["invested"] += cost
+                source_metrics[src]["fees"] += fee
                 cash_flows.append((dt, -cost))
                 
         elif tx_type == "SELL":
@@ -78,7 +90,8 @@ def compute_portfolio(transactions: list[dict]) -> dict:
             cash_flows.append((dt, proceeds))
             if ticker != "CASH" and ticker in positions_data:
                 p = positions_data[ticker]
-                avg_cost = p["total_bought_value"] / p["total_bought_qty"] if p["total_bought_qty"] > 0 else 0
+                # Use running avg cost (cost of remaining shares) not all-time avg
+                avg_cost = p["running_cost_basis"] / p["running_qty"] if p["running_qty"] > 0 else 0
                 
                 if pd.notna(real_pnl_val) and real_pnl_val is not None:
                     p["realized_pnl"] += real_pnl_val
@@ -88,6 +101,7 @@ def compute_portfolio(transactions: list[dict]) -> dict:
                 p["running_qty"] -= qty
                 p["running_cost_basis"] -= (avg_cost * qty)
                 p["realized_count"] += 1
+                source_metrics[src]["fees"] += fee
                 
         elif tx_type == "DIVIDEND":
             cash_balance += qty * price
@@ -99,6 +113,7 @@ def compute_portfolio(transactions: list[dict]) -> dict:
                 dividends_per_ticker[ticker]["total_eur"] += qty * price
                 dividends_per_ticker[ticker]["last_date"] = dt
                 dividends_per_ticker[ticker]["count"] += 1
+            source_metrics[src]["dividends"] += qty * price
                 
         elif tx_type == "WITHHOLDING_TAX":
             cash_balance -= qty * price
@@ -150,13 +165,15 @@ def compute_portfolio(transactions: list[dict]) -> dict:
             open_positions.append({
                 "ticker": ticker,
                 "asset_class": asset_class,
+                "source": source_map.get(ticker, "Unknown"),
                 "qty": qty,
                 "avg_cost": avg_cost,
                 "price": price,
                 "market_value": mkt_val,
                 "unrealized_pnl": unrealized,
                 "unrealized_pnl_pct": unrealized_pct,
-                "realized_pnl": p["realized_pnl"]
+                "realized_pnl": p["realized_pnl"],
+                "weight_pct": 0.0  # Will be calculated after total is known
             })
             
             if ticker in dividends_per_ticker:
@@ -167,6 +184,45 @@ def compute_portfolio(transactions: list[dict]) -> dict:
     total_pnl_pct = (total_pnl / total_invested_gross * 100) if total_invested_gross > 0 else 0
 
     total_invested_capital = total_portfolio_value - total_pnl
+
+    # Calculate position weights and HHI
+    for pos in open_positions:
+        pos["weight_pct"] = (pos["market_value"] / total_portfolio_value * 100) if total_portfolio_value > 0 else 0
+    
+    hhi = sum((pos["weight_pct"] / 100) ** 2 for pos in open_positions) * 10000 if open_positions else 0
+    
+    # Win/Loss analysis from closed positions
+    wins = []
+    losses = []
+    for ticker, p in positions_data.items():
+        if p["realized_count"] > 0:
+            if p["realized_pnl"] > 0:
+                wins.append(p["realized_pnl"])
+            elif p["realized_pnl"] < 0:
+                losses.append(p["realized_pnl"])
+    
+    total_closed = len(wins) + len(losses)
+    win_rate = (len(wins) / total_closed * 100) if total_closed > 0 else None
+    avg_win = (sum(wins) / len(wins)) if wins else 0
+    avg_loss = (sum(losses) / len(losses)) if losses else 0
+    profit_factor = (sum(wins) / abs(sum(losses))) if losses and sum(losses) != 0 else None
+    
+    # Cost drag
+    cost_drag_pct = ((total_fees + withholding_tax) / total_invested_gross * 100) if total_invested_gross > 0 else 0
+    
+    # Dividend yield on cost
+    div_yield_on_cost = (dividend_income / total_invested_gross * 100) if total_invested_gross > 0 else 0
+    
+    # Source breakdown for dashboard
+    source_breakdown = []
+    for src_name, metrics in source_metrics.items():
+        source_breakdown.append({
+            "name": src_name,
+            "invested": metrics["invested"],
+            "realized_pnl": metrics["realized_pnl"],
+            "fees": metrics["fees"],
+            "dividends": metrics["dividends"]
+        })
 
     # XIRR
     xirr_val = None
@@ -195,9 +251,14 @@ def compute_portfolio(transactions: list[dict]) -> dict:
     # Fast timeseries build
     # Accumulate running qty and cash efficiently
     # df is sorted by date
-    running_qtys = {t: 0.0 for t in active_tickers}
+    # Include ALL tickers (not just active) so mid-period holdings show in timeseries
+    all_tickers = list(positions_data.keys())
+    running_qtys = {t: 0.0 for t in all_tickers}
     running_cash = 0.0
     running_inv = 0.0
+    # Track per-ticker cost basis for accurate invested capital on sells
+    running_cost_per_ticker = {t: 0.0 for t in all_tickers}
+    running_qty_per_ticker = {t: 0.0 for t in all_tickers}
     
     tx_idx = 0
     num_tx = len(df)
@@ -230,11 +291,19 @@ def compute_portfolio(transactions: list[dict]) -> dict:
                 running_inv += cost
                 if ticker in running_qtys:
                     running_qtys[ticker] += qty
+                    running_cost_per_ticker[ticker] += cost
+                    running_qty_per_ticker[ticker] += qty
             elif tx_type == "SELL":
                 running_cash += proceeds
-                running_inv -= proceeds
+                # Subtract cost basis of sold units, not proceeds
                 if ticker in running_qtys:
+                    avg_c = running_cost_per_ticker[ticker] / running_qty_per_ticker[ticker] if running_qty_per_ticker[ticker] > 0 else 0
+                    running_inv -= avg_c * qty
                     running_qtys[ticker] -= qty
+                    running_cost_per_ticker[ticker] -= avg_c * qty
+                    running_qty_per_ticker[ticker] -= qty
+                else:
+                    running_inv -= proceeds
             elif tx_type == "DIVIDEND":
                 running_cash += qty * price
             elif tx_type == "WITHHOLDING_TAX":
@@ -270,7 +339,10 @@ def compute_portfolio(transactions: list[dict]) -> dict:
     volatility = None
     annualized_return = None
     sharpe = None
+    sortino = None
+    calmar = None
     max_dd = None
+    twr = None
     
     if len(temp_nw_values) >= 60:
         s = pd.Series(temp_nw_values)
@@ -280,11 +352,27 @@ def compute_portfolio(transactions: list[dict]) -> dict:
             ret = ((1 + pct_change.mean()) ** 252) - 1
             volatility = vol * 100
             annualized_return = ret * 100
+            
+            # Sharpe ratio (2.5% risk-free rate)
             sharpe = (annualized_return - 2.5) / volatility if volatility > 0 else 0
             
+            # Sortino ratio (downside deviation only)
+            downside = pct_change[pct_change < 0]
+            if not downside.empty:
+                downside_dev = downside.std() * math.sqrt(252)
+                sortino = (annualized_return - 2.5) / (downside_dev * 100) if downside_dev > 0 else 0
+            
+            # Max drawdown
             rolling_max = s.cummax()
             drawdown = (s - rolling_max) / rolling_max
             max_dd = drawdown.min() * 100
+            
+            # Calmar ratio (return / |max drawdown|)
+            calmar = (annualized_return / abs(max_dd)) if max_dd and max_dd != 0 else None
+            
+            # Time-Weighted Return
+            cumulative = (1 + pct_change).prod()
+            twr = (cumulative - 1) * 100
 
     # Format transactions for template
     tx_out = []
@@ -303,9 +391,7 @@ def compute_portfolio(transactions: list[dict]) -> dict:
         elif tx_type == "WITHHOLDING_TAX": rcash -= qty * price
         
         # total column in table
-        total_eur = 0.0
-        if tx_type in ("BUY", "SELL"): total_eur = qty * price
-        else: total_eur = qty * price
+        total_eur = qty * price
         
         tx_out.append({
             "date": row["date"].strftime("%d.%m.%Y %H:%M"),
@@ -338,15 +424,34 @@ def compute_portfolio(transactions: list[dict]) -> dict:
             "total_pnl_pct": total_pnl_pct,
             "xirr": xirr_val,
             "realized_pnl": total_realized_with_divs,
-            "dividend_income": dividend_income
+            "unrealized_pnl": total_unrealized_pnl,
+            "dividend_income": dividend_income,
+            "total_invested": total_invested_gross,
+            "total_fees": total_fees,
+            "withholding_tax": withholding_tax,
+            "twr": twr
         },
         "risk": {
             "volatility": volatility,
             "sharpe_ratio": sharpe,
+            "sortino_ratio": sortino,
+            "calmar_ratio": calmar,
             "max_drawdown": max_dd,
             "beta": None
         },
+        "analytics": {
+            "win_rate": win_rate,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "profit_factor": profit_factor,
+            "hhi": hhi,
+            "cost_drag_pct": cost_drag_pct,
+            "div_yield_on_cost": div_yield_on_cost,
+            "positions_count": len(open_positions),
+            "closed_count": total_closed
+        },
         "allocation": allocation,
+        "source_breakdown": source_breakdown,
         "positions": sorted(open_positions, key=lambda x: x["market_value"], reverse=True),
         "transactions": tx_out,
         "dividends": sorted(div_list, key=lambda x: x["total_eur"], reverse=True),
@@ -360,9 +465,11 @@ def compute_portfolio(transactions: list[dict]) -> dict:
 
 def _empty_portfolio():
     return {
-        "kpis": {"total_value": 0, "total_pnl": 0, "total_pnl_pct": 0, "xirr": None, "realized_pnl": 0, "dividend_income": 0},
-        "risk": {"volatility": None, "sharpe_ratio": None, "max_drawdown": None, "beta": None},
+        "kpis": {"total_value": 0, "total_pnl": 0, "total_pnl_pct": 0, "xirr": None, "realized_pnl": 0, "unrealized_pnl": 0, "dividend_income": 0, "total_invested": 0, "total_fees": 0, "withholding_tax": 0, "twr": None},
+        "risk": {"volatility": None, "sharpe_ratio": None, "sortino_ratio": None, "calmar_ratio": None, "max_drawdown": None, "beta": None},
+        "analytics": {"win_rate": None, "avg_win": 0, "avg_loss": 0, "profit_factor": None, "hhi": 0, "cost_drag_pct": 0, "div_yield_on_cost": 0, "positions_count": 0, "closed_count": 0},
         "allocation": {"Stock/ETF": 0, "Crypto": 0, "Cash": 0},
+        "source_breakdown": [],
         "positions": [],
         "transactions": [],
         "dividends": [],

@@ -24,7 +24,7 @@ def parse_bitpanda_csv(filepath: str) -> list[dict]:
         asset_class = str(row.get("Asset class", ""))
         
         # Timestamp parsing
-        dt = pd.to_datetime(row.get("Timestamp"), utc=True).tz_localize(None).to_pydatetime()
+        dt = pd.to_datetime(row.get("Timestamp"), utc=True).tz_convert(None).to_pydatetime()
         
         amount_asset = float(row.get("Amount Asset", 0.0)) if pd.notna(row.get("Amount Asset")) and row.get("Amount Asset") != "-" else 0.0
         amount_fiat = float(row.get("Amount Fiat", 0.0)) if pd.notna(row.get("Amount Fiat")) and row.get("Amount Fiat") != "-" else 0.0

@@ -3,7 +3,7 @@ import glob
 from datetime import datetime
 from flask import Flask, render_template, jsonify
 
-from parsers import parse_xtb_xlsx, parse_bitpanda_csv
+from parsers import parse_xtb_xlsx, parse_bitpanda_csv, parse_etoro, is_etoro_file
 from engine import compute_portfolio, clear_cache
 
 app = Flask(__name__)
@@ -11,32 +11,62 @@ app = Flask(__name__)
 # Server-side caching state
 cached_data = None
 last_updated = None
-source_counts = {"XTB": 0, "Bitpanda": 0}
+source_counts = {"XTB": 0, "Bitpanda": 0, "eToro": 0}
 parsed_files = 0
 total_transactions = 0
+parsing_errors = []
 
-TX_DIR = os.path.join(os.path.dirname(__file__), "transactions")
+TX_DIR = os.path.join(os.path.dirname(__file__), "broker-statements")
 
 def load_all_transactions():
     transactions = []
-    global source_counts, parsed_files
-    source_counts = {"XTB": 0, "Bitpanda": 0}
+    global source_counts, parsed_files, parsing_errors
+    source_counts = {"XTB": 0, "Bitpanda": 0, "eToro": 0}
     parsed_files = 0
+    parsing_errors = []
     
     if not os.path.exists(TX_DIR):
         os.makedirs(TX_DIR)
         return transactions
 
     for filepath in glob.glob(os.path.join(TX_DIR, "*")):
+        # Skip hidden files
+        if os.path.basename(filepath).startswith("."):
+            continue
+            
         ext = os.path.splitext(filepath)[1].lower()
         if ext in [".xlsx", ".xls"]:
+            # Detect eToro XLSX/XLS first (by sheet names)
+            is_etoro = False
             try:
-                txs = parse_xtb_xlsx(filepath)
-                transactions.extend(txs)
-                parsed_files += 1
-                source_counts["XTB"] += 1
-            except Exception as e:
-                print(f"Failed to parse XTB XLSX {filepath}: {e}")
+                is_etoro = is_etoro_file(filepath)
+            except Exception:
+                pass
+                
+            if is_etoro:
+                try:
+                    txs = parse_etoro(filepath)
+                    transactions.extend(txs)
+                    parsed_files += 1
+                    source_counts["eToro"] += 1
+                except Exception as e:
+                    err_msg = str(e)
+                    if "does not support the old .xls" in err_msg or ext == ".xls":
+                        err_msg = "Excel 97-2003 (.xls) format is not supported by openpyxl. Please convert the file to .xlsx or .csv."
+                    print(f"Failed to parse eToro XLSX {filepath}: {e}")
+                    parsing_errors.append({"file": os.path.basename(filepath), "error": err_msg})
+            else:
+                try:
+                    txs = parse_xtb_xlsx(filepath)
+                    transactions.extend(txs)
+                    parsed_files += 1
+                    source_counts["XTB"] += 1
+                except Exception as e:
+                    err_msg = str(e)
+                    if "does not support the old .xls" in err_msg or ext == ".xls":
+                        err_msg = "Excel 97-2003 (.xls) format is not supported by openpyxl. Please convert the file to .xlsx or .csv."
+                    print(f"Failed to parse XTB XLSX {filepath}: {e}")
+                    parsing_errors.append({"file": os.path.basename(filepath), "error": err_msg})
         elif ext == ".csv":
             try:
                 # Read first 10 lines for signature
@@ -48,12 +78,25 @@ def load_all_transactions():
                     transactions.extend(txs)
                     parsed_files += 1
                     source_counts["Bitpanda"] += 1
+                elif is_etoro_file(filepath):
+                    txs = parse_etoro(filepath)
+                    transactions.extend(txs)
+                    parsed_files += 1
+                    source_counts["eToro"] += 1
                 elif "Open time" in sample and "Gross P/L" in sample:
-                    print(f"XTB CSV detected ({filepath}); please export as XLSX for best compatibility or implement CSV xtb parser")
+                    msg = "XTB CSV detected; please export as XLSX for best compatibility or implement CSV xtb parser"
+                    print(f"{msg} ({filepath})")
+                    parsing_errors.append({"file": os.path.basename(filepath), "error": msg})
                 else:
-                    print(f"Unknown CSV format: {filepath}")
+                    msg = "Unknown CSV format: Headers did not match Bitpanda or eToro templates"
+                    print(f"{msg}: {filepath}")
+                    parsing_errors.append({"file": os.path.basename(filepath), "error": msg})
             except Exception as e:
                 print(f"Failed to parse CSV {filepath}: {e}")
+                parsing_errors.append({"file": os.path.basename(filepath), "error": str(e)})
+        elif ext not in [".txt", ".md"]: # Skip readme/documentation files
+            msg = f"Unsupported file type '{ext}'"
+            parsing_errors.append({"file": os.path.basename(filepath), "error": msg})
                 
     return transactions
 
@@ -81,12 +124,12 @@ def trigger_pipeline():
 
 @app.route("/")
 def index():
-    if cached_data is None:
-        trigger_pipeline()
+    trigger_pipeline()
     
     sources_loaded = []
     if source_counts["XTB"] > 0: sources_loaded.append("XTB")
     if source_counts["Bitpanda"] > 0: sources_loaded.append("Bitpanda")
+    if source_counts["eToro"] > 0: sources_loaded.append("eToro")
     
     return render_template(
         "dashboard.html",
@@ -97,9 +140,12 @@ def index():
         allocation=cached_data["allocation"],
         dividends=cached_data["dividends"],
         risk=cached_data["risk"],
+        analytics=cached_data["analytics"],
+        source_breakdown=cached_data["source_breakdown"],
         last_updated=last_updated,
         sources_loaded=sources_loaded,
-        parsed_files=parsed_files
+        parsed_files=parsed_files,
+        parsing_errors=parsing_errors
     )
 
 @app.route("/api/reload", methods=["POST"])
@@ -110,7 +156,8 @@ def reload_data():
         "status": "success",
         "transactions_count": total_transactions,
         "positions_count": pos_count,
-        "last_updated": last_updated
+        "last_updated": last_updated,
+        "parsing_errors": parsing_errors
     })
 
 @app.route("/api/data", methods=["GET"])
