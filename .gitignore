@@ -6,6 +6,9 @@ broker-statements/*
 diagnostics-report-*.md
 diagnostics-report-*.json
 
+# Generated performance report (embeds your holdings/values)
+portfolio_performance.html
+
 # Python cache & compiled files
 __pycache__/
 *.pyc
