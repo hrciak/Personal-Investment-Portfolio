@@ -296,6 +296,7 @@
     .source-xtb { background: rgba(79, 142, 247, 0.1); color: var(--accent); }
     .source-bitpanda { background: rgba(230, 168, 23, 0.1); color: var(--gold); }
     .source-etoro { background: rgba(45, 206, 137, 0.1); color: var(--pos); }
+    .source-trading212 { background: rgba(79, 175, 247, 0.12); color: #6fc2ff; }
     .source-unknown { background: rgba(90, 100, 120, 0.1); color: var(--t2); }
 
     .type-badge {
@@ -461,7 +462,7 @@
   {% macro fmt_num(val, p=2) %}{% if val != None %}{{ "{:,.{}f}".format(val, p) }}{% else %}N/A{% endif %}{% endmacro %}
   {% macro color_cls(val) %}{% if val and val > 0 %}pos{% elif val and val < 0 %}neg{% else %}neu{% endif %}{% endmacro %}
   {% macro format_qty(qty, is_crypto) %}{% if is_crypto %}{{ "{:,.8f}".format(qty) }}{% else %}{{ "{:,.4f}".format(qty) }}{% endif %}{% endmacro %}
-  {% macro source_cls(src) %}{% if src == 'XTB' %}source-xtb{% elif src == 'Bitpanda' %}source-bitpanda{% elif src == 'eToro' %}source-etoro{% else %}source-unknown{% endif %}{% endmacro %}
+  {% macro source_cls(src) %}{% if src == 'XTB' %}source-xtb{% elif src == 'Bitpanda' %}source-bitpanda{% elif src == 'eToro' %}source-etoro{% elif src == 'Trading212' %}source-trading212{% else %}source-unknown{% endif %}{% endmacro %}
 
   {% if parsing_errors %}
     <div id="error-modal" class="modal-overlay">

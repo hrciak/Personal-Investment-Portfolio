@@ -2,7 +2,8 @@ import os
 from datetime import datetime
 from flask import Flask, render_template, jsonify
 
-from parsers import parse_xtb_xlsx, parse_bitpanda_csv, parse_etoro, is_etoro_file
+from parsers import (parse_xtb_xlsx, parse_bitpanda_csv, parse_etoro, is_etoro_file,
+                     parse_trading212_csv, is_trading212_file)
 from engine import compute_portfolio, clear_cache
 
 app = Flask(__name__)
@@ -10,7 +11,7 @@ app = Flask(__name__)
 # Server-side caching state
 cached_data = None
 last_updated = None
-source_counts = {"XTB": 0, "Bitpanda": 0, "eToro": 0}
+source_counts = {"XTB": 0, "Bitpanda": 0, "eToro": 0, "Trading212": 0}
 parsed_files = 0
 total_transactions = 0
 parsing_errors = []
@@ -20,7 +21,7 @@ TX_DIR = os.path.join(os.path.dirname(__file__), "broker-statements")
 def load_all_transactions():
     transactions = []
     global source_counts, parsed_files, parsing_errors
-    source_counts = {"XTB": 0, "Bitpanda": 0, "eToro": 0}
+    source_counts = {"XTB": 0, "Bitpanda": 0, "eToro": 0, "Trading212": 0}
     parsed_files = 0
     parsing_errors = []
     
@@ -82,6 +83,11 @@ def load_all_transactions():
                     transactions.extend(txs)
                     parsed_files += 1
                     source_counts["Bitpanda"] += 1
+                elif is_trading212_file(filepath):
+                    txs = parse_trading212_csv(filepath)
+                    transactions.extend(txs)
+                    parsed_files += 1
+                    source_counts["Trading212"] += 1
                 elif is_etoro_file(filepath):
                     txs = parse_etoro(filepath)
                     transactions.extend(txs)
@@ -92,7 +98,7 @@ def load_all_transactions():
                     print(f"{msg} ({filepath})")
                     parsing_errors.append({"file": os.path.basename(filepath), "error": msg})
                 else:
-                    msg = "Unknown CSV format: Headers did not match Bitpanda or eToro templates"
+                    msg = "Unknown CSV format: Headers did not match Bitpanda, Trading212 or eToro templates"
                     print(f"{msg}: {filepath}")
                     parsing_errors.append({"file": os.path.basename(filepath), "error": msg})
             except Exception as e:
@@ -134,6 +140,7 @@ def index():
     if source_counts["XTB"] > 0: sources_loaded.append("XTB")
     if source_counts["Bitpanda"] > 0: sources_loaded.append("Bitpanda")
     if source_counts["eToro"] > 0: sources_loaded.append("eToro")
+    if source_counts["Trading212"] > 0: sources_loaded.append("Trading212")
     
     return render_template(
         "dashboard.html",
