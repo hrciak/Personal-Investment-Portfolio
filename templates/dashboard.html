@@ -10,26 +10,54 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     :root {
-      --bg: #0b0e14;
-      --surface: #131820;
-      --card: #181d27;
-      --border: #1e2a3a;
-      --t1: #e8eaf0;
-      --t2: #5a6478;
+      --bg: #06081a;
+      --surface: rgba(18, 23, 52, 0.55);
+      --card: rgba(23, 29, 64, 0.45);
+      --card-solid: #141937;
+      --border: rgba(255, 255, 255, 0.07);
+      --border-hover: rgba(124, 140, 255, 0.38);
+      --t1: #eef0fb;
+      --t2: #8b91c2;
       --pos: #2dce89;
       --neg: #f25f70;
-      --accent: #4f8ef7;
+      --accent: #7c8cff;
       --gold: #e6a817;
       --warn: #f0a04f;
       --purple: #a78bfa;
-      --teal: #2dd4bf;
+      --teal: #36d6c3;
+      --green: #3ddc97;
+      --radius: 16px;
+      --card-shadow: 0 10px 34px rgba(3, 5, 20, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      --glow: 0 0 0 1px rgba(124, 140, 255, 0.12), 0 14px 40px rgba(40, 60, 180, 0.18);
     }
-    
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      background: var(--bg); color: var(--t1);
+      color: var(--t1);
       font-family: 'DM Sans', sans-serif;
       padding: 0 0 100px 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(1200px 620px at 72% -12%, rgba(92, 104, 224, 0.22), transparent 60%),
+        radial-gradient(900px 500px at 8% 4%, rgba(120, 86, 220, 0.14), transparent 55%),
+        linear-gradient(165deg, #0c1234 0%, #090d28 50%, #06081a 100%);
+      background-attachment: fixed;
+    }
+
+    /* GLASS CARD — applied to every block so the redesign cascades */
+    .kpi-card, .risk-card, .source-card, .chart-box, .analytics-card,
+    .table-wrap, .empty-state, .platform-hero {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--card-shadow);
+      -webkit-backdrop-filter: blur(16px);
+      backdrop-filter: blur(16px);
+    }
+    .kpi-card:hover, .risk-card:hover, .source-card:hover,
+    .chart-box:hover, .analytics-card:hover {
+      border-color: var(--border-hover);
+      box-shadow: var(--glow);
     }
     
     /* UTILS */
@@ -43,13 +71,15 @@
     /* HEADER */
     .header {
       display: flex; justify-content: space-between; align-items: center;
-      padding: 24px 32px; border-bottom: 1px solid var(--border);
-      background: linear-gradient(180deg, var(--surface) 0%, rgba(19,24,32,0.95) 100%);
-      backdrop-filter: blur(12px);
+      padding: 22px 32px; border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      -webkit-backdrop-filter: blur(18px);
+      backdrop-filter: blur(18px);
+      position: sticky; top: 0; z-index: 50;
     }
     .header h1 {
-      font-family: 'IBM Plex Mono', monospace; color: var(--accent);
-      letter-spacing: 0.15em; font-size: 20px; font-weight: 600; text-transform: uppercase;
+      font-family: 'DM Sans', sans-serif; font-size: 24px; font-weight: 700;
+      letter-spacing: -0.01em; color: var(--t1);
     }
     .badges {
       display: flex; gap: 8px;
@@ -89,11 +119,11 @@
     .badge-soon:hover { transform: none; }
     .actions { display: flex; align-items: center; gap: 16px; font-size: 12px; color: var(--t2); }
     .btn {
-      background: linear-gradient(135deg, var(--accent), #3a6fd8); color: #fff; border: none; padding: 8px 16px;
-      border-radius: 6px; cursor: pointer; font-family: 'DM Sans', sans-serif;
+      background: linear-gradient(135deg, #8b5cf6 0%, #6c8cff 100%); color: #fff; border: none; padding: 9px 18px;
+      border-radius: 10px; cursor: pointer; font-family: 'DM Sans', sans-serif;
       font-weight: 600; font-size: 12px; transition: all 0.2s ease;
     }
-    .btn:hover { opacity: 0.9; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(79,142,247,0.3); }
+    .btn:hover { opacity: 0.95; transform: translateY(-1px); box-shadow: 0 6px 18px rgba(124,140,255,0.4); }
 
     .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
     
@@ -106,7 +136,7 @@
     /* KPI ROW */
     .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
     .kpi-card {
-      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
       padding: 20px; display: flex; flex-direction: column; gap: 8px;
       transition: all 0.2s ease;
     }
@@ -116,7 +146,7 @@
       transform: translateY(-2px);
     }
     .kpi-label { font-size: 11px; color: var(--t2); text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; }
-    .kpi-val { font-size: 26px; font-family: 'IBM Plex Mono', monospace; font-weight: 500; }
+    .kpi-val { font-size: 27px; font-family: 'DM Sans', sans-serif; font-weight: 700; letter-spacing: -0.02em; }
     .kpi-sub { font-size: 12px; color: var(--t2); }
 
     /* SECTION LABEL */
@@ -132,7 +162,7 @@
     /* RISK ROW */
     .risk-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 24px; }
     .risk-card {
-      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
       padding: 16px; display: flex; flex-direction: column; gap: 6px;
       transition: all 0.2s ease;
     }
@@ -147,7 +177,7 @@
     /* SOURCE BREAKDOWN */
     .source-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 24px; }
     .source-card {
-      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
       padding: 16px; display: flex; flex-direction: column; gap: 10px;
       transition: all 0.2s ease;
     }
@@ -173,12 +203,32 @@
     .charts-row { display: grid; grid-template-columns: 65% 1fr; gap: 16px; margin-bottom: 24px; }
     .chart-hero { margin-bottom: 24px; }
     .chart-hero canvas { max-height: 340px; }
+    .chart-controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 16px; flex-wrap: wrap; }
+    .mode-toggle { display: inline-flex; background: rgba(255,255,255,0.04); border: 1px solid var(--border); border-radius: 9px; padding: 3px; }
+    .mode-btn { background: transparent; border: none; color: var(--t2); padding: 6px 14px; border-radius: 7px; cursor: pointer; font-family: 'DM Sans', sans-serif; font-size: 12px; font-weight: 600; transition: all 0.18s ease; }
+    .mode-btn.active { background: linear-gradient(135deg, #8b5cf6, #6c8cff); color: #fff; }
+    .chart-note { font-size: 11px; color: var(--t2); margin-bottom: 10px; line-height: 1.5; }
+    .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+    .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .switch-track {
+      width: 34px; height: 18px; border-radius: 10px; background: rgba(255,255,255,0.12);
+      position: relative; transition: background 0.2s ease; flex-shrink: 0;
+    }
+    .switch-thumb {
+      position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%;
+      background: #c3c8ee; transition: transform 0.2s ease, background 0.2s ease;
+    }
+    .switch input:checked + .switch-track { background: rgba(242, 95, 112, 0.55); }
+    .switch input:checked + .switch-track .switch-thumb { transform: translateX(16px); background: #fff; }
+    .switch input:focus-visible + .switch-track { box-shadow: 0 0 0 2px rgba(124,140,255,0.5); }
+    .switch-label { font-size: 11px; color: var(--t2); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
+    .event-dot-legend { width: 8px; height: 8px; border-radius: 50%; background: var(--neg); box-shadow: 0 0 6px rgba(242,95,112,0.7); display: inline-block; }
     .holdings-row {
       display: grid; grid-template-columns: minmax(0, 1fr) 320px;
       gap: 16px; margin-bottom: 24px; align-items: start;
     }
     .chart-box {
-      background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px;
+      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px;
       transition: all 0.2s ease;
     }
     .chart-box:hover {
@@ -188,10 +238,10 @@
 
     /* TABLE */
     .section-title { font-size: 11px; letter-spacing: 1.5px; color: var(--t2); text-transform: uppercase; font-weight: 600; margin: 32px 0 12px; }
-    .table-wrap { overflow-x: auto; background: var(--card); border: 1px solid var(--border); border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .table-wrap { overflow-x: auto; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; background: transparent; }
     thead th {
-      background: var(--surface); padding: 10px 14px; text-align: right;
+      background: rgba(18, 23, 52, 0.85); padding: 11px 14px; text-align: right;
       font-size: 10px; letter-spacing: 1.2px; color: var(--t2);
       text-transform: uppercase; font-weight: 600; position: sticky; top: 0;
       border-bottom: 1px solid var(--border); cursor: pointer; white-space: nowrap;
@@ -201,10 +251,10 @@
     thead th:first-child { text-align: left; }
     td { padding: 12px 14px; border-bottom: 1px solid var(--border); text-align: right; font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
     td:first-child { text-align: left; }
-    tr:nth-child(even) { background: #131820; }
-    tr:nth-child(odd) { background: #0f1318; }
+    tr:nth-child(even) { background: rgba(255, 255, 255, 0.018); }
+    tr:nth-child(odd) { background: transparent; }
     tbody tr { transition: background 0.15s ease; }
-    tbody tr:hover { background: rgba(79,142,247,0.05); }
+    tbody tr:hover { background: rgba(124, 140, 255, 0.08); }
     
     .cell-pnl.pos { background: rgba(45, 206, 137, 0.08); color: var(--pos); }
     .cell-pnl.neg { background: rgba(242, 95, 112, 0.08); color: var(--neg); }
@@ -249,13 +299,14 @@
       width: 60px; height: 4px; background: rgba(90,100,120,0.3); border-radius: 2px; display: inline-block; vertical-align: middle; margin-right: 6px;
     }
     .weight-fill {
-      height: 100%; border-radius: 2px; background: var(--accent); transition: width 0.3s ease;
+      height: 100%; border-radius: 2px; transition: width 0.3s ease;
+      background: linear-gradient(90deg, #8b5cf6, #36d6c3);
     }
 
     /* Analytics cards */
     .analytics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 24px; }
     .analytics-card {
-      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
       padding: 16px; display: flex; flex-direction: column; gap: 6px;
       transition: all 0.2s ease;
     }
@@ -277,20 +328,22 @@
     /* MODAL OVERLAY & POPUP */
     .modal-overlay {
       position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(11, 14, 20, 0.85);
-      backdrop-filter: blur(8px);
+      background: rgba(5, 7, 22, 0.78);
+      backdrop-filter: blur(10px);
       display: flex; align-items: center; justify-content: center;
       z-index: 1000;
       animation: fadeIn 0.2s ease-out;
     }
-    
+
     .modal-content {
-      background: var(--surface);
+      background: linear-gradient(165deg, rgba(26, 32, 70, 0.96), rgba(16, 21, 48, 0.96));
       border: 1px solid rgba(242, 95, 112, 0.3);
-      border-radius: 12px;
+      border-radius: var(--radius);
       width: 90%; max-width: 550px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.5), 0 0 15px rgba(242, 95, 112, 0.1);
+      box-shadow: 0 20px 50px rgba(0,0,0,0.55), 0 0 24px rgba(242, 95, 112, 0.08);
       display: flex; flex-direction: column;
+      -webkit-backdrop-filter: blur(20px);
+      backdrop-filter: blur(20px);
       animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
     }
     
@@ -334,13 +387,13 @@
     .platform-modal-content { border-color: rgba(79,142,247,0.3); max-width: 440px; box-shadow: 0 10px 30px rgba(0,0,0,0.5), 0 0 15px rgba(79,142,247,0.1); }
     .platform-modal-header h3 { color: var(--t1); }
     .platform-hero {
-      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
       padding: 20px; text-align: center; margin-bottom: 16px;
     }
     .platform-hero-label { font-size: 11px; color: var(--t2); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
     .platform-hero-val { font-size: 30px; font-weight: 500; margin: 6px 0 2px; color: var(--accent); }
     .platform-hero-sub { font-size: 12px; color: var(--t2); }
-    .platform-grid { display: flex; flex-direction: column; gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .platform-grid { display: flex; flex-direction: column; gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
     .platform-stat {
       display: flex; justify-content: space-between; align-items: center;
       padding: 12px 16px; background: var(--card); font-size: 13px;
@@ -466,6 +519,18 @@
     <!-- PORTFOLIO PERFORMANCE (hero) -->
     <div class="section-label" style="margin-top: 8px;">Portfolio Performance</div>
     <div class="chart-box chart-hero">
+      <div class="chart-controls">
+        <div class="mode-toggle">
+          <button type="button" id="modeAbs" class="mode-btn active" onclick="setChartMode('abs')">Absolute €</button>
+          <button type="button" id="modeTwr" class="mode-btn" onclick="setChartMode('twr')">TWR vs S&amp;P 500</button>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="toggleEvents" checked>
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+          <span class="switch-label"><span class="event-dot-legend"></span>Cash flow markers</span>
+        </label>
+      </div>
+      <p class="chart-note" id="chartNote"></p>
       <canvas id="nwChart" height="320"></canvas>
     </div>
 
@@ -698,8 +763,9 @@
     {% endif %}
 
     <!-- TRANSACTIONS TABLE -->
-    <div class="section-title">Transactions History</div>
-    <div class="table-wrap">
+    <details>
+      <summary>Transactions History ({{ transactions|length }} Transactions)</summary>
+      <div class="table-wrap">
       <table id="tbl-tx">
         <thead>
           <tr>
@@ -739,7 +805,8 @@
           {% endfor %}
         </tbody>
       </table>
-    </div>
+      </div>
+    </details>
 
     {% endif %}
   </div>
@@ -821,71 +888,152 @@
 
     // Chart configs if data exists
     {% if charts and charts.dates|length > 0 %}
-    Chart.defaults.color = '#5a6478';
+    Chart.defaults.color = '#8b91c2';
     Chart.defaults.font.family = "'DM Sans', sans-serif";
 
     const dates = {{ charts.dates | tojson }};
     const nwData = {{ charts.net_worth | tojson }};
     const invData = {{ charts.invested | tojson }};
     const benchData = {{ charts.benchmark | tojson }};
+    const eventData = {{ charts.events | tojson }};
+    const eventLabels = {{ charts.event_labels | tojson }};
+    const twrData = {{ charts.twr | tojson }};
+    const eventTwr = eventData.map(function(v, i){ return v == null ? null : twrData[i]; });
 
-    new Chart(document.getElementById('nwChart'), {
-      type: 'line',
-      data: {
-        labels: dates,
-        datasets: [
+    // Purple -> cyan -> green horizontal stroke gradient (matches reference)
+    function lineGradient(ctx, area) {
+      const g = ctx.createLinearGradient(area.left, 0, area.right, 0);
+      g.addColorStop(0, '#8b5cf6');
+      g.addColorStop(0.5, '#4f8ef7');
+      g.addColorStop(0.78, '#36d6c3');
+      g.addColorStop(1, '#3ddc97');
+      return g;
+    }
+    // Soft vertical fill fading to transparent
+    function fillGradient(ctx, area) {
+      const g = ctx.createLinearGradient(0, area.top, 0, area.bottom);
+      g.addColorStop(0, 'rgba(91, 140, 247, 0.28)');
+      g.addColorStop(0.55, 'rgba(91, 140, 247, 0.08)');
+      g.addColorStop(1, 'rgba(91, 140, 247, 0)');
+      return g;
+    }
+
+    let nwChart = null;
+    let chartMode = 'abs';
+
+    function markerDataset(mode, showEvents) {
+      return {
+        label: 'Cash flow',
+        data: showEvents ? (mode === 'abs' ? eventData : eventTwr) : [],
+        showLine: false,
+        pointRadius: function(c) { return c.raw == null ? 0 : 5; },
+        pointHoverRadius: function(c) { return c.raw == null ? 0 : 7; },
+        pointBackgroundColor: '#f25f70',
+        pointBorderColor: 'rgba(255,255,255,0.85)',
+        pointBorderWidth: 1.5,
+        yAxisID: 'y'
+      };
+    }
+
+    function buildDatasets(mode, showEvents) {
+      if (mode === 'abs') {
+        return [
+          markerDataset(mode, showEvents),
           {
-            label: 'Portfolio Value',
-            data: nwData,
-            borderColor: '#4f8ef7',
-            backgroundColor: 'rgba(79, 142, 247, 0.1)',
-            borderWidth: 2,
-            tension: 0.2,
-            pointRadius: 0,
-            fill: true,
-            yAxisID: 'y'
+            label: 'Portfolio Value', data: nwData,
+            borderColor: function(c) { const {ctx, chartArea} = c.chart; return chartArea ? lineGradient(ctx, chartArea) : '#6c8cff'; },
+            backgroundColor: function(c) { const {ctx, chartArea} = c.chart; return chartArea ? fillGradient(ctx, chartArea) : 'transparent'; },
+            borderWidth: 2.5, tension: 0.4, pointRadius: 0, pointHoverRadius: 5,
+            pointHoverBackgroundColor: '#fff', pointHoverBorderColor: '#6c8cff', fill: true, yAxisID: 'y'
           },
           {
-            label: 'Invested Capital',
-            data: invData,
-            borderColor: 'rgba(232, 234, 240, 0.4)',
-            borderWidth: 1.5,
-            borderDash: [5, 5],
-            pointRadius: 0,
-            yAxisID: 'y'
+            label: 'Invested Capital', data: invData,
+            borderColor: 'rgba(180, 188, 230, 0.35)', borderWidth: 1.5, borderDash: [5, 5],
+            pointRadius: 0, tension: 0.4, yAxisID: 'y'
           },
           {
-            label: 'S&P 500 (Base 100)',
-            data: benchData,
-            borderColor: '#e6a817',
-            borderWidth: 1,
-            borderDash: [2, 2],
-            pointRadius: 0,
-            yAxisID: 'y1'
+            label: 'S&P 500 (Base 100)', data: benchData,
+            borderColor: 'rgba(230, 168, 23, 0.7)', borderWidth: 1.25, borderDash: [2, 3],
+            pointRadius: 0, tension: 0.3, yAxisID: 'y1'
           }
-        ]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: {
-          legend: { position: 'bottom', labels: { boxWidth: 12 } },
-          tooltip: {
-            callbacks: {
-              label: function(ctx) {
-                if(ctx.datasetIndex === 2) return ctx.dataset.label + ': ' + ctx.raw.toFixed(2);
-                return ctx.dataset.label + ': €' + ctx.raw.toLocaleString(undefined, {minimumFractionDigits:2});
-              }
-            }
-          }
-        },
-        interaction: { mode: 'index', intersect: false },
-        scales: {
-          x: { grid: { color: '#1e2a3a' }, ticks: { maxTicksLimit: 10 } },
-          y: { grid: { color: '#1e2a3a' }, type: 'linear', display: true, position: 'left' },
-          y1: { grid: { drawOnChartArea: false }, type: 'linear', display: true, position: 'right' }
-        }
+        ];
       }
-    });
+      return [
+        markerDataset(mode, showEvents),
+        {
+          label: 'Portfolio TWR', data: twrData,
+          borderColor: '#36d6c3', backgroundColor: 'rgba(54, 214, 195, 0.10)',
+          borderWidth: 2.5, tension: 0.4, pointRadius: 0, pointHoverRadius: 5,
+          pointHoverBackgroundColor: '#fff', pointHoverBorderColor: '#36d6c3', fill: true, yAxisID: 'y'
+        },
+        {
+          label: 'S&P 500 (Base 100)', data: benchData,
+          borderColor: 'rgba(230, 168, 23, 0.85)', borderWidth: 1.5, borderDash: [5, 3],
+          pointRadius: 0, tension: 0.3, yAxisID: 'y'
+        }
+      ];
+    }
+
+    function buildScales(mode) {
+      const x = { grid: { color: 'rgba(255,255,255,0.05)' }, border: { display: false }, ticks: { maxTicksLimit: 10 } };
+      if (mode === 'abs') {
+        return {
+          x,
+          y: { grid: { color: 'rgba(255,255,255,0.05)' }, border: { display: false }, position: 'left',
+               ticks: { callback: function(v) { return '€' + v.toLocaleString('en-US'); } } },
+          y1: { grid: { drawOnChartArea: false }, border: { display: false }, position: 'right',
+                title: { display: true, text: 'S&P 500 (base 100)', color: '#8b91c2', font: { size: 11 } } }
+        };
+      }
+      return {
+        x,
+        y: { grid: { color: 'rgba(255,255,255,0.05)' }, border: { display: false }, position: 'left',
+             title: { display: true, text: 'Index (base 100 = inception)', color: '#8b91c2', font: { size: 11 } },
+             ticks: { callback: function(v) { return Math.round(v); } } }
+      };
+    }
+
+    function tipLabel(ctx) {
+      const ds = ctx.dataset.label;
+      if (ds === 'Cash flow') return ctx.raw == null ? null : (eventLabels[ctx.dataIndex] || 'Cash flow');
+      if (ds === 'S&P 500 (Base 100)' || ds === 'Portfolio TWR') return ds + ': ' + ctx.raw.toFixed(1);
+      return ds + ': €' + ctx.raw.toLocaleString(undefined, {minimumFractionDigits: 2});
+    }
+
+    function renderChart() {
+      const showEvents = document.getElementById('toggleEvents').checked;
+      if (nwChart) nwChart.destroy();
+      nwChart = new Chart(document.getElementById('nwChart'), {
+        type: 'line',
+        data: { labels: dates, datasets: buildDatasets(chartMode, showEvents) },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            legend: { position: 'bottom', labels: { boxWidth: 12, usePointStyle: true, padding: 18, filter: function(item) { return item.text !== 'Cash flow'; } } },
+            tooltip: {
+              backgroundColor: 'rgba(13, 17, 44, 0.95)', borderColor: 'rgba(124, 140, 255, 0.25)', borderWidth: 1,
+              padding: 12, cornerRadius: 10, titleColor: '#eef0fb', bodyColor: '#c3c8ee',
+              callbacks: { label: tipLabel }
+            }
+          },
+          scales: buildScales(chartMode)
+        }
+      });
+    }
+
+    function setChartMode(m) {
+      chartMode = m;
+      document.getElementById('modeAbs').classList.toggle('active', m === 'abs');
+      document.getElementById('modeTwr').classList.toggle('active', m === 'twr');
+      document.getElementById('chartNote').textContent = m === 'abs'
+        ? 'Real EUR balances. The S&P 500 (amber, right axis, base 100) is a scale reference — not a like-for-like comparison.'
+        : 'Time-Weighted Return strips out deposit size and timing, so it is directly comparable to the S&P 500. Both indexed to 100 at inception.';
+      renderChart();
+    }
+
+    document.getElementById('toggleEvents').addEventListener('change', renderChart);
+    setChartMode('abs');
 
     const alloc = {{ allocation | tojson }};
     new Chart(document.getElementById('allocChart'), {
@@ -894,16 +1042,23 @@
         labels: ['Stock/ETF', 'Crypto', 'Cash'],
         datasets: [{
           data: [alloc['Stock/ETF'] || 0, alloc['Crypto'] || 0, alloc['Cash'] || 0],
-          backgroundColor: ['#4f8ef7', '#e6a817', '#5a6478'],
-          borderWidth: 0
+          backgroundColor: ['#6c8cff', '#a78bfa', '#36d6c3'],
+          borderColor: 'rgba(9, 13, 40, 0.6)',
+          borderWidth: 2,
+          hoverOffset: 6
         }]
       },
       options: {
         responsive: true, maintainAspectRatio: false,
-        cutout: '75%',
+        cutout: '74%',
         plugins: {
-          legend: { position: 'bottom', labels: { usePointStyle: true, boxWidth: 8 } },
+          legend: { position: 'bottom', labels: { usePointStyle: true, boxWidth: 8, padding: 14 } },
           tooltip: {
+            backgroundColor: 'rgba(13, 17, 44, 0.95)',
+            borderColor: 'rgba(124, 140, 255, 0.25)',
+            borderWidth: 1,
+            padding: 12,
+            cornerRadius: 10,
             callbacks: {
               label: function(ctx) {
                 const total = ctx.dataset.data.reduce((a, b) => a + b, 0);

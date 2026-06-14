@@ -7,6 +7,10 @@ from pyxirr import xirr
 from parsers.base import classify_asset
 from engine.prices import get_current_prices, get_benchmark_series, get_historical_prices
 
+# A fetched price above this multiple of a position's average cost is treated as
+# a bad data point (wrong-instrument symbol collision or feed glitch) and capped.
+PRICE_SANITY_MULT = 25.0
+
 def compute_portfolio(transactions: list[dict]) -> dict:
     if not transactions:
         return _empty_portfolio()
@@ -122,16 +126,27 @@ def compute_portfolio(transactions: list[dict]) -> dict:
             withholding_tax += qty * price
             cash_flows.append((dt, -(qty * price)))
 
-    # Fetch live prices
-    # Determine fallback prices from last transaction or market_price_at_export
+    # Fetch live prices.
+    # Fallback prices cover EVERY ever-held ticker (not only currently-open ones)
+    # so positions that were opened and later closed can still be valued during
+    # the period they were held. Open positions prefer the export market price;
+    # everything else falls back to its average cost basis.
     fallback = {}
     for ticker, p in positions_data.items():
-        if p["running_qty"] > 0:
-            if pd.notna(p["market_price_at_export"]):
-                fallback[ticker] = float(p["market_price_at_export"])
-            elif p["total_bought_qty"] > 0:
-                fallback[ticker] = float(p["total_bought_value"] / p["total_bought_qty"])
-    
+        if p["running_qty"] > 0 and pd.notna(p["market_price_at_export"]):
+            fallback[ticker] = float(p["market_price_at_export"])
+        elif p["total_bought_qty"] > 0:
+            fallback[ticker] = float(p["total_bought_value"] / p["total_bought_qty"])
+
+    # Average cost paid per ticker — used as a sanity reference for prices.
+    # A fetched price wildly above what was ever paid (e.g. a Bitpanda micro-token
+    # whose symbol collides with an unrelated Yahoo stock) is a bad data point.
+    avg_cost_map = {}
+    for ticker, p in positions_data.items():
+        if p["total_bought_qty"] > 0:
+            avg_cost_map[ticker] = p["total_bought_value"] / p["total_bought_qty"]
+
+    all_tickers = list(positions_data.keys())
     active_tickers = [t for t, p in positions_data.items() if p["running_qty"] > 0.0001]
     current_prices = get_current_prices(active_tickers, fallback, source_map)
     
@@ -151,6 +166,11 @@ def compute_portfolio(transactions: list[dict]) -> dict:
         if p["running_qty"] > 0.0001:
             qty = p["running_qty"]
             price = current_prices.get(ticker, 0.0)
+            # Same sanity cap as the historical series: a live price far above the
+            # average cost is a wrong-instrument match -> fall back to cost basis.
+            ac = avg_cost_map.get(ticker, 0.0)
+            if ac > 0 and price > ac * PRICE_SANITY_MULT:
+                price = ac
             mkt_val = qty * price
             cost_basis = p["running_cost_basis"]
             unrealized = mkt_val - cost_basis
@@ -257,9 +277,38 @@ def compute_portfolio(transactions: list[dict]) -> dict:
     today = datetime.date.today()
     
     date_range = pd.date_range(start=first_date, end=today, freq='D')
-    hist_prices = get_historical_prices(active_tickers, str(first_date), str(today), source_map)
+    hist_prices = get_historical_prices(all_tickers, str(first_date), str(today), source_map)
     bench_series = get_benchmark_series(str(first_date), str(today))
-    
+
+    # Pre-align each ticker's price history to the daily range (forward-filled,
+    # leading gaps filled with the cost-basis fallback). This turns the per-day
+    # valuation into an O(1) array lookup instead of re-filtering each series
+    # every day — important now that ALL ever-held tickers are valued.
+    norm_range = date_range.normalize()
+    aligned_prices = {}
+    for t in all_tickers:
+        ps = hist_prices.get(t)
+        if ps is not None and not ps.empty:
+            s = ps.copy()
+            idx = pd.to_datetime(s.index)
+            if getattr(idx, "tz", None) is not None:
+                idx = idx.tz_localize(None)
+            s.index = idx.normalize()
+            s = s[~s.index.duplicated(keep="last")]
+            s = s.reindex(norm_range).ffill()
+            if t in fallback:
+                s = s.fillna(fallback[t])
+            arr = s.to_numpy().copy()
+            # Sanity filter: any price above PRICE_SANITY_MULT x average cost is a
+            # bad data point (wrong-instrument symbol collision / glitch) — cap it
+            # at the cost basis so it cannot spike the chart.
+            ac = avg_cost_map.get(t, 0.0)
+            if ac > 0:
+                arr[arr > ac * PRICE_SANITY_MULT] = ac
+            aligned_prices[t] = arr
+        else:
+            aligned_prices[t] = None  # no series -> scalar fallback used below
+
     nw_series = []
     inv_series = []
     
@@ -280,12 +329,21 @@ def compute_portfolio(transactions: list[dict]) -> dict:
     
     dates_list = [d.strftime('%Y-%m-%d') for d in date_range]
     benchmark_list = []
-    
+
     temp_nw_values = []
-    
-    for current_dt in date_range:
+    # Cash-flow markers: net-worth value on days with a deposit/withdrawal (else None)
+    event_values = []
+    event_labels = []
+    # Cash-flow-neutral Time-Weighted Return, indexed to 100 at inception
+    twr_list = []
+    twr_idx = 100.0
+    prev_val = None
+
+    for day_i, current_dt in enumerate(date_range):
         current_dt_end = current_dt + pd.Timedelta(days=1, microseconds=-1)
-        
+        day_deposit = 0.0
+        day_withdrawal = 0.0
+
         while tx_idx < num_tx and df.iloc[tx_idx]["date"] <= current_dt_end:
             row = df.iloc[tx_idx]
             ticker = row["ticker"]
@@ -293,14 +351,16 @@ def compute_portfolio(transactions: list[dict]) -> dict:
             price = row["price"]
             tx_type = row["type"]
             fee = row["fee"]
-            
+
             cost = (qty * price) + fee if pd.notna(price) else 0.0
             proceeds = (qty * price) - fee if pd.notna(price) else 0.0
 
             if tx_type == "DEPOSIT":
                 running_cash += qty * price
+                day_deposit += qty * price
             elif tx_type == "WITHDRAWAL":
                 running_cash -= qty * price
+                day_withdrawal += qty * price
             elif tx_type == "BUY":
                 running_cash -= cost
                 running_inv += cost
@@ -328,18 +388,15 @@ def compute_portfolio(transactions: list[dict]) -> dict:
             
         current_dt_str = current_dt.strftime('%Y-%m-%d')
         daily_val = running_cash
-        
-        for t in active_tickers:
+
+        # Value every ticker still held on this day (open or later-closed)
+        for t in all_tickers:
             r_qty = running_qtys[t]
             if r_qty > 0.0001:
-                price_series = hist_prices.get(t)
-                p_val = 0.0
-                if price_series is not None and not price_series.empty:
-                    # Forward fill logic per date
-                    subset = price_series[price_series.index <= current_dt]
-                    if not subset.empty:
-                        p_val = subset.iloc[-1]
-                    else:
+                arr = aligned_prices.get(t)
+                if arr is not None:
+                    p_val = arr[day_i]
+                    if p_val != p_val:  # NaN (price history starts after this day)
                         p_val = fallback.get(t, 0.0)
                 else:
                     p_val = fallback.get(t, 0.0)
@@ -349,6 +406,34 @@ def compute_portfolio(transactions: list[dict]) -> dict:
         inv_series.append({"date": current_dt_str, "value": max(running_inv, 0)})
         temp_nw_values.append(daily_val)
         benchmark_list.append(bench_series.get(current_dt_str, None))
+
+        if day_deposit > 0 or day_withdrawal > 0:
+            parts = []
+            if day_deposit > 0:
+                parts.append(f"+€{day_deposit:,.0f} deposit")
+            if day_withdrawal > 0:
+                parts.append(f"−€{day_withdrawal:,.0f} withdrawal")
+            event_values.append(daily_val)
+            event_labels.append(" · ".join(parts))
+        else:
+            event_values.append(None)
+            event_labels.append(None)
+
+        # Daily-linked TWR: remove the day's external flow before measuring the
+        # market return, so deposits/withdrawals never move the index. Per-day
+        # return clamped to +/-50% as a guard against residual price glitches.
+        net_cf_today = day_deposit - day_withdrawal
+        if prev_val is None:
+            twr_list.append(100.0)
+        else:
+            if prev_val > 1.0:
+                r = (daily_val - net_cf_today) / prev_val - 1.0
+                r = max(-0.5, min(0.5, r))
+            else:
+                r = 0.0
+            twr_idx *= (1.0 + r)
+            twr_list.append(twr_idx)
+        prev_val = daily_val
 
     # RISK METRICS
     volatility = None
@@ -474,7 +559,10 @@ def compute_portfolio(transactions: list[dict]) -> dict:
             "dates": dates_list,
             "net_worth": [x["value"] for x in nw_series],
             "invested": [x["value"] for x in inv_series],
-            "benchmark": benchmark_list
+            "benchmark": benchmark_list,
+            "events": event_values,
+            "event_labels": event_labels,
+            "twr": twr_list
         }
     }
 
@@ -488,5 +576,5 @@ def _empty_portfolio():
         "positions": [],
         "transactions": [],
         "dividends": [],
-        "charts": {"dates": [], "net_worth": [], "invested": [], "benchmark": []}
+        "charts": {"dates": [], "net_worth": [], "invested": [], "benchmark": [], "events": [], "event_labels": [], "twr": []}
     }
