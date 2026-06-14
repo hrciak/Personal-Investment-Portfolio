@@ -35,7 +35,10 @@ def create_transaction(
     position_id: str = None,
     market_price_at_export: float = None,
     source: str = "",
-    currency: str = "EUR"
+    currency: str = "EUR",
+    isin: str = None,
+    raw_symbol: str = None,
+    asset_class_hint: str = ""
 ) -> dict:
     return {
         "date": date,
@@ -48,5 +51,11 @@ def create_transaction(
         "position_id": position_id,
         "market_price_at_export": float(market_price_at_export) if market_price_at_export is not None else None,
         "source": source,
-        "currency": currency.upper()
+        "currency": currency.upper(),
+        # Identifiers used to resolve the correct Yahoo / CoinGecko symbol:
+        "isin": (isin.strip().upper() if isin and str(isin).strip() not in ("", "-") else None),
+        # Broker symbol WITH its exchange suffix (e.g. XTB "VUSA.UK"); ticker is stripped
+        "raw_symbol": (raw_symbol.strip() if raw_symbol else None),
+        # Broker's own asset-class label (e.g. Bitpanda "Cryptocurrency")
+        "asset_class_hint": asset_class_hint or ""
     }

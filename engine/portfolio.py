@@ -6,6 +6,7 @@ from pyxirr import xirr
 
 from parsers.base import classify_asset
 from engine.prices import get_current_prices, get_benchmark_series, get_historical_prices
+from engine.symbols import build_symbol_map
 
 # A fetched price above this multiple of a position's average cost is treated as
 # a bad data point (wrong-instrument symbol collision or feed glitch) and capped.
@@ -25,9 +26,15 @@ def compute_portfolio(transactions: list[dict]) -> dict:
         
     df = df.sort_values("date", ascending=True).reset_index(drop=True)
     
-    # Pre-compute source map
+    # Pre-compute source map, asset-class hints, and resolved Yahoo symbols
     source_map = df.drop_duplicates("ticker").set_index("ticker")["source"].to_dict()
-    
+    if "asset_class_hint" in df.columns:
+        asset_class_map = (df[df["asset_class_hint"].astype(bool)]
+                           .drop_duplicates("ticker").set_index("ticker")["asset_class_hint"].to_dict())
+    else:
+        asset_class_map = {}
+    symbol_map = build_symbol_map(transactions)
+
     # 1. POSITIONS & CASH
     positions_data = {}
     cash_balance = 0.0
@@ -148,7 +155,7 @@ def compute_portfolio(transactions: list[dict]) -> dict:
 
     all_tickers = list(positions_data.keys())
     active_tickers = [t for t, p in positions_data.items() if p["running_qty"] > 0.0001]
-    current_prices = get_current_prices(active_tickers, fallback, source_map)
+    current_prices = get_current_prices(active_tickers, fallback, source_map, asset_class_map, symbol_map)
     
     # Build final positions map
     open_positions = []
@@ -166,10 +173,11 @@ def compute_portfolio(transactions: list[dict]) -> dict:
         if p["running_qty"] > 0.0001:
             qty = p["running_qty"]
             price = current_prices.get(ticker, 0.0)
-            # Same sanity cap as the historical series: a live price far above the
-            # average cost is a wrong-instrument match -> fall back to cost basis.
             ac = avg_cost_map.get(ticker, 0.0)
-            if ac > 0 and price > ac * PRICE_SANITY_MULT:
+            # A live price far above average cost is a wrong-instrument match;
+            # a zero/missing price means no quote was found. In both cases fall
+            # back to cost basis so a holding is never shown as a total loss.
+            if ac > 0 and (price <= 0 or price > ac * PRICE_SANITY_MULT):
                 price = ac
             mkt_val = qty * price
             cost_basis = p["running_cost_basis"]
@@ -180,7 +188,7 @@ def compute_portfolio(transactions: list[dict]) -> dict:
             total_market_value += mkt_val
             total_unrealized_pnl += unrealized
             
-            asset_class = classify_asset(ticker, source_map.get(ticker, ""))
+            asset_class = classify_asset(ticker, source_map.get(ticker, ""), asset_class_map.get(ticker, ""))
             if asset_class in allocation:
                 allocation[asset_class] += mkt_val
                 
@@ -277,7 +285,7 @@ def compute_portfolio(transactions: list[dict]) -> dict:
     today = datetime.date.today()
     
     date_range = pd.date_range(start=first_date, end=today, freq='D')
-    hist_prices = get_historical_prices(all_tickers, str(first_date), str(today), source_map)
+    hist_prices = get_historical_prices(all_tickers, str(first_date), str(today), source_map, asset_class_map, symbol_map)
     bench_series = get_benchmark_series(str(first_date), str(today))
 
     # Pre-align each ticker's price history to the daily range (forward-filled,
@@ -503,7 +511,7 @@ def compute_portfolio(transactions: list[dict]) -> dict:
             "total": total_eur,
             "fee": row["fee"],
             "running_cash": rcash,
-            "asset_class": classify_asset(row["ticker"], row["source"])
+            "asset_class": classify_asset(row["ticker"], row["source"], asset_class_map.get(row["ticker"], ""))
         })
     tx_out.reverse()
 

@@ -33,15 +33,15 @@ def parse_bitpanda_csv(filepath: str) -> list[dict]:
         asset = str(row.get("Asset", ""))
         
         if tx_type_raw == "buy":
-            transactions.append(create_transaction(dt, asset, "BUY", amount_asset, asset_price, fee=0.0, source="Bitpanda"))
+            transactions.append(create_transaction(dt, asset, "BUY", amount_asset, asset_price, fee=0.0, source="Bitpanda", asset_class_hint=asset_class))
         elif tx_type_raw == "sell":
-            transactions.append(create_transaction(dt, asset, "SELL", amount_asset, asset_price, fee=0.0, source="Bitpanda"))
+            transactions.append(create_transaction(dt, asset, "SELL", amount_asset, asset_price, fee=0.0, source="Bitpanda", asset_class_hint=asset_class))
         elif tx_type_raw == "deposit":
             transactions.append(create_transaction(dt, "CASH", "DEPOSIT", amount_fiat, 1.0, fee=0.0, source="Bitpanda"))
         elif tx_type_raw == "withdrawal":
             transactions.append(create_transaction(dt, "CASH", "WITHDRAWAL", amount_fiat, 1.0, fee=0.0, source="Bitpanda"))
         elif tx_type_raw in ("savings", "staking"):
-            transactions.append(create_transaction(dt, asset, "DIVIDEND", amount_asset, asset_price, source="Bitpanda"))
+            transactions.append(create_transaction(dt, asset, "DIVIDEND", amount_asset, asset_price, source="Bitpanda", asset_class_hint=asset_class))
         elif tx_type_raw in ("-", ""):
             if in_out == "incoming" and asset_class == "Fiat":
                 transactions.append(create_transaction(dt, "CASH", "DEPOSIT", amount_fiat, 1.0, fee=0.0, source="Bitpanda"))

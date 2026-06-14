@@ -13,6 +13,9 @@ portfolio_performance.html
 static/conai_logo.png
 static/conai-brain-logo.png
 
+# Resolved-symbol cache (rebuilds itself from statements)
+symbol_cache.json
+
 # Python cache & compiled files
 __pycache__/
 *.pyc

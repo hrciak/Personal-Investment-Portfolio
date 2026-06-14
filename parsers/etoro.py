@@ -292,14 +292,15 @@ def _parse_closed(sheet, rate) -> list:
         # Prices to EUR (rates are USD on the instrument)
         open_price_eur = open_rate_usd * rate
         close_price_eur = close_rate_usd * rate
+        isin = _get(r, "isin")
 
         txs.append(create_transaction(
             date=open_date, ticker=ticker, tx_type="BUY", qty=units,
-            price=open_price_eur, fee=0.0, position_id=pos_id, source="eToro"))
+            price=open_price_eur, fee=0.0, position_id=pos_id, source="eToro", isin=isin))
         txs.append(create_transaction(
             date=close_date, ticker=ticker, tx_type="SELL", qty=units,
             price=close_price_eur, fee=0.0, realized_pnl=profit_eur,
-            position_id=pos_id, source="eToro"))
+            position_id=pos_id, source="eToro", isin=isin))
     return txs
 
 

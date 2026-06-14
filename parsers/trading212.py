@@ -94,7 +94,7 @@ def parse_trading212_csv(filepath: str) -> list:
                 continue
             transactions.append(create_transaction(
                 date=dt, ticker=ticker, tx_type="BUY", qty=shares, price=price_eur,
-                fee=_fees(r), source="Trading212"))
+                fee=_fees(r), source="Trading212", isin=r.get("ISIN")))
 
         elif "sell" in action:
             if not ticker:
@@ -104,7 +104,7 @@ def parse_trading212_csv(filepath: str) -> list:
                 date=dt, ticker=ticker, tx_type="SELL", qty=shares, price=price_eur,
                 fee=_fees(r),
                 realized_pnl=_f(result) if result not in (None, "", "-") else None,
-                source="Trading212"))
+                source="Trading212", isin=r.get("ISIN")))
 
         elif "dividend" in action:
             sym = ticker or "CASH"

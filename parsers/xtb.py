@@ -46,14 +46,15 @@ def parse_xtb_xlsx(filepath: str) -> list[dict]:
                 if not r.get("Symbol") or not r.get("Open time") or not r.get("Close time"):
                     continue
                 
-                ticker = strip_ticker(r.get("Symbol", ""))
+                raw_symbol = str(r.get("Symbol", ""))
+                ticker = strip_ticker(raw_symbol)
                 vol = float(r.get("Volume", 0.0))
                 open_p = float(r.get("Open price", 0.0))
                 close_p = float(r.get("Close price", 0.0))
                 comm = float(r.get("Commission", 0.0))
                 pos_id = str(r.get("Position", ""))
                 gross_pl = float(r.get("Gross P/L", 0.0) or r.get("Gross P/L ", 0.0))
-                
+
                 # BUY leg
                 transactions.append(create_transaction(
                     date=r["Open time"],
@@ -64,9 +65,10 @@ def parse_xtb_xlsx(filepath: str) -> list[dict]:
                     fee=abs(comm) / 2,
                     realized_pnl=None,
                     position_id=pos_id,
-                    source="XTB"
+                    source="XTB",
+                    raw_symbol=raw_symbol
                 ))
-                
+
                 # SELL leg
                 transactions.append(create_transaction(
                     date=r["Close time"],
@@ -77,7 +79,8 @@ def parse_xtb_xlsx(filepath: str) -> list[dict]:
                     fee=abs(comm) / 2,
                     realized_pnl=gross_pl,
                     position_id=pos_id,
-                    source="XTB"
+                    source="XTB",
+                    raw_symbol=raw_symbol
                 ))
 
     # 2. OPEN POSITION
@@ -91,12 +94,13 @@ def parse_xtb_xlsx(filepath: str) -> list[dict]:
                 if not r.get("Symbol") or not r.get("Open time"):
                     continue
                 
-                ticker = strip_ticker(r.get("Symbol", ""))
+                raw_symbol = str(r.get("Symbol", ""))
+                ticker = strip_ticker(raw_symbol)
                 vol = float(r.get("Volume", 0.0))
                 open_p = float(r.get("Open price", 0.0))
                 mkt_p = float(r.get("Market price", 0.0))
                 pos_id = str(r.get("Position", ""))
-                
+
                 transactions.append(create_transaction(
                     date=r["Open time"],
                     ticker=ticker,
@@ -106,7 +110,8 @@ def parse_xtb_xlsx(filepath: str) -> list[dict]:
                     fee=0.0,
                     market_price_at_export=mkt_p,
                     position_id=pos_id,
-                    source="XTB"
+                    source="XTB",
+                    raw_symbol=raw_symbol
                 ))
 
     # 3. CASH OPERATION HISTORY
