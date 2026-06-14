@@ -9,6 +9,10 @@ diagnostics-report-*.json
 # Generated performance report (embeds your holdings/values)
 portfolio_performance.html
 
+# Large source logos — the app uses the optimized *_sm.png copies (committed)
+static/conai_logo.png
+static/conai-brain-logo.png
+
 # Python cache & compiled files
 __pycache__/
 *.pyc

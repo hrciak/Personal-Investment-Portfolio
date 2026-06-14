@@ -35,7 +35,7 @@
     body {
       color: var(--t1);
       font-family: 'DM Sans', sans-serif;
-      padding: 0 0 100px 0;
+      padding: 0;
       min-height: 100vh;
       background:
         radial-gradient(1200px 620px at 72% -12%, rgba(92, 104, 224, 0.22), transparent 60%),
@@ -78,9 +78,12 @@
       position: sticky; top: 0; z-index: 50;
     }
     .header h1 {
-      font-family: 'DM Sans', sans-serif; font-size: 24px; font-weight: 700;
-      letter-spacing: -0.01em; color: var(--t1);
+      font-family: 'DM Sans', sans-serif; font-size: 22px; font-weight: 700;
+      letter-spacing: -0.01em; color: var(--t1); line-height: 1.15;
     }
+    .brand { display: flex; flex-direction: column; gap: 4px; }
+    .brand-by { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--t2); font-weight: 500; }
+    .brand-logo { height: 18px; width: auto; opacity: 0.9; vertical-align: middle; }
     .badges {
       display: flex; gap: 8px;
     }
@@ -126,6 +129,25 @@
     .btn:hover { opacity: 0.95; transform: translateY(-1px); box-shadow: 0 6px 18px rgba(124,140,255,0.4); }
 
     .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+    /* FOOTER */
+    .site-footer {
+      margin-top: 48px; border-top: 1px solid var(--border);
+      background: var(--surface);
+      -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
+    }
+    .footer-inner {
+      max-width: 1400px; margin: 0 auto; padding: 28px 32px;
+      display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    }
+    .footer-brain { height: 40px; width: auto; opacity: 0.95; }
+    .footer-text { display: flex; flex-direction: column; gap: 3px; }
+    .footer-tagline { font-size: 13px; color: var(--t1); font-weight: 500; }
+    .footer-copy { font-size: 11px; color: var(--t2); letter-spacing: 0.3px; }
+    .footer-logo { height: 26px; width: auto; opacity: 0.9; margin-left: auto; }
+    @media (max-width: 600px) {
+      .footer-logo { margin-left: 0; }
+    }
     
     /* EMPTY STATE */
     .empty-state {
@@ -293,6 +315,26 @@
       transition: color 0.2s;
     }
     summary:hover { color: var(--accent); }
+
+    /* HOLDINGS FILTER BAR */
+    .filter-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; margin-bottom: 14px; }
+    .filter-group { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .filter-label { font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--t2); font-weight: 700; margin-right: 2px; }
+    .filter-chip {
+      font-family: 'DM Sans', sans-serif; font-size: 11px; font-weight: 600;
+      padding: 4px 10px; border-radius: 12px; cursor: pointer;
+      border: 1px solid transparent; background: rgba(255,255,255,0.05); color: var(--t2);
+      opacity: 0.6; transition: opacity 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    .filter-chip:hover { opacity: 0.9; transform: translateY(-1px); }
+    .filter-chip.active { opacity: 1; box-shadow: 0 0 0 1px currentColor inset; }
+    .filter-clear {
+      font-family: 'DM Sans', sans-serif; font-size: 11px; font-weight: 600; cursor: pointer;
+      padding: 4px 10px; border-radius: 12px; border: 1px solid var(--border);
+      background: transparent; color: var(--t2); transition: all 0.15s ease;
+    }
+    .filter-clear:hover { color: var(--t1); border-color: var(--border-hover); }
+    .filter-count { font-size: 11px; color: var(--t2); font-family: 'IBM Plex Mono', monospace; }
 
     /* Weight bar */
     .weight-bar {
@@ -489,7 +531,10 @@
   </div>
 
   <div class="header">
-    <h1>Portfolio</h1>
+    <div class="brand">
+      <h1>Your personal portfolio dashboard</h1>
+      <div class="brand-by">by <img src="{{ url_for('static', filename='conai_logo_sm.png') }}" alt="ConAI" class="brand-logo"></div>
+    </div>
     <div class="badges">
       {% for s in sources_loaded %}
         <button type="button"
@@ -576,6 +621,26 @@
 
     <!-- HOLDINGS & ALLOCATION -->
     <div class="section-label">Holdings &amp; Allocation</div>
+    {% set hold_classes = positions | map(attribute='asset_class') | unique | list %}
+    {% set hold_sources = positions | map(attribute='source') | unique | list %}
+    <div class="filter-bar">
+      <div class="filter-group">
+        <span class="filter-label">Class</span>
+        {% for c in hold_classes %}
+          <button type="button" class="filter-chip class-chip {% if c == 'Crypto' %}class-crypto{% elif c == 'Stock/ETF' %}class-stock{% else %}class-cash{% endif %}"
+            data-filter-group="class" data-filter-value="{{ c }}" onclick="toggleHoldingFilter(this)">{{ c }}</button>
+        {% endfor %}
+      </div>
+      <div class="filter-group">
+        <span class="filter-label">Source</span>
+        {% for s in hold_sources %}
+          <button type="button" class="filter-chip source-chip {{ source_cls(s) }}"
+            data-filter-group="source" data-filter-value="{{ s }}" onclick="toggleHoldingFilter(this)">{{ s }}</button>
+        {% endfor %}
+      </div>
+      <button type="button" id="filter-clear" class="filter-clear" onclick="clearHoldingFilters()" style="display:none;">Clear filters</button>
+      <span id="filter-count" class="filter-count"></span>
+    </div>
     <div class="holdings-row">
       <div class="table-wrap">
         <table id="tbl-pos">
@@ -596,7 +661,7 @@
           </thead>
           <tbody>
             {% for p in positions %}
-            <tr>
+            <tr class="holding-row" data-class="{{ p.asset_class }}" data-source="{{ p.source }}">
               <td style="font-family: 'DM Sans', sans-serif; font-weight:600; font-size:13px">{{ p.ticker }}</td>
               <td>
                 {% if p.asset_class == 'Crypto' %}<span class="class-pill class-crypto">Crypto</span>
@@ -810,6 +875,17 @@
 
     {% endif %}
   </div>
+
+  <footer class="site-footer">
+    <div class="footer-inner">
+      <img src="{{ url_for('static', filename='conai-brain-logo_sm.png') }}" alt="ConAI" class="footer-brain">
+      <div class="footer-text">
+        <div class="footer-tagline">Developed by ConAI, your long-term partner in AI</div>
+        <div class="footer-copy">© 2026 ConAI</div>
+      </div>
+      <img src="{{ url_for('static', filename='conai_logo_sm.png') }}" alt="ConAI" class="footer-logo">
+    </div>
+  </footer>
 
   <script>
     function closeErrorModal() {
@@ -1051,6 +1127,14 @@
       options: {
         responsive: true, maintainAspectRatio: false,
         cutout: '74%',
+        onClick: function(evt, elements, chart) {
+          if (elements.length > 0) {
+            filterByClass(chart.data.labels[elements[0].index]);
+          }
+        },
+        onHover: function(evt, elements) {
+          evt.native.target.style.cursor = elements.length > 0 ? 'pointer' : 'default';
+        },
         plugins: {
           legend: { position: 'bottom', labels: { usePointStyle: true, boxWidth: 8, padding: 14 } },
           tooltip: {
@@ -1101,6 +1185,59 @@
         }
       });
       rows.forEach(r => tb.appendChild(r));
+    }
+
+    // Holdings filter by class and source (each group AND-ed; empty group = all)
+    const holdingFilters = { class: new Set(), source: new Set() };
+
+    function toggleHoldingFilter(btn) {
+      const group = btn.getAttribute('data-filter-group');
+      const value = btn.getAttribute('data-filter-value');
+      const set = holdingFilters[group];
+      if (set.has(value)) { set.delete(value); btn.classList.remove('active'); }
+      else { set.add(value); btn.classList.add('active'); }
+      applyHoldingFilters();
+    }
+
+    function clearHoldingFilters() {
+      holdingFilters.class.clear();
+      holdingFilters.source.clear();
+      document.querySelectorAll('.filter-chip.active').forEach(c => c.classList.remove('active'));
+      applyHoldingFilters();
+    }
+
+    // Drill into a class from the allocation pie: show only that class's holdings.
+    // Clicking the same class again clears it. No-op for classes with no holdings.
+    function filterByClass(className) {
+      const rows = document.querySelectorAll('#tbl-pos tbody tr.holding-row');
+      const hasAny = Array.from(rows).some(r => r.getAttribute('data-class') === className);
+      if (!hasAny) return;
+      const set = holdingFilters.class;
+      const isSole = set.size === 1 && set.has(className);
+      set.clear();
+      if (!isSole) set.add(className);
+      document.querySelectorAll('.filter-chip[data-filter-group="class"]').forEach(chip => {
+        chip.classList.toggle('active', set.has(chip.getAttribute('data-filter-value')));
+      });
+      applyHoldingFilters();
+      document.getElementById('tbl-pos').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    function applyHoldingFilters() {
+      const cls = holdingFilters.class, src = holdingFilters.source;
+      const rows = document.querySelectorAll('#tbl-pos tbody tr.holding-row');
+      let shown = 0;
+      rows.forEach(r => {
+        const okClass = cls.size === 0 || cls.has(r.getAttribute('data-class'));
+        const okSource = src.size === 0 || src.has(r.getAttribute('data-source'));
+        const visible = okClass && okSource;
+        r.style.display = visible ? '' : 'none';
+        if (visible) shown++;
+      });
+      const active = cls.size + src.size;
+      document.getElementById('filter-clear').style.display = active ? '' : 'none';
+      document.getElementById('filter-count').textContent =
+        active ? (shown + ' of ' + rows.length + ' holdings') : '';
     }
   </script>
 </body>
