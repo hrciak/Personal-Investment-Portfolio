@@ -1,229 +1,159 @@
 #!/usr/bin/env python3
 """
 Diagnostics report generator
-=============================
+============================
 
-Scans broker-statements/, runs every parser, resolves prices for all tickers,
-checks the S&P 500 benchmark feed, and writes a timestamped Markdown + JSON
-report listing every processing issue so it can be triaged afterwards:
+Runs the exact pipeline the dashboard uses (parsers.load_statements +
+engine.compute_portfolio) and writes a timestamped Markdown + JSON report
+(gitignored) listing every processing issue:
 
-  * Files that could not be parsed (unsupported formats, bad sheets, ...)
-  * Tickers whose live price could not be resolved on Yahoo / CoinGecko
-  * For each unresolved stock, a probe of common exchange suffixes (.DE, .L,
-    .AS, ...) with a suggested working symbol where one is found
-  * Whether the benchmark (S&P 500) feed loaded
+  * files that could not be parsed
+  * data-quality notes (statement coverage gaps, positions closed in an
+    uncovered period, negative reconstructed cash, unmatched sales, ...)
+  * holdings whose price feed is missing or was rejected by the engine's
+    trade-price validation, with the symbol and currency that were tried
+  * for unresolved stocks, an optional probe of common exchange suffixes
+    (.DE, .L, .AS, ...) suggesting a symbol for symbol_overrides.json
+  * whether the S&P 500 benchmark loaded
 
 Usage:
-    python diagnostics.py                # full report
-    python diagnostics.py --no-probe     # skip the slower exchange-suffix probe
-
-Run it from the project root with the project's virtualenv Python.
+    python diagnostics.py              # full report
+    python diagnostics.py --no-probe   # skip the slower exchange-suffix probe
 """
 
 import os
 import sys
 import json
 import argparse
-from collections import Counter, defaultdict
-from datetime import datetime, date
+from collections import Counter
+from datetime import datetime
 
-import requests
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
+
 import yfinance as yf
 
-import app  # reuse the app's loader so we see the exact same parsing behavior
-from parsers.base import classify_asset
-from engine.prices import get_benchmark_series, COINGECKO_ID_MAP
+from parsers import load_statements
+from engine import compute_portfolio
+from engine.symbols import OVERRIDES_PATH
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+TX_DIR = os.path.join(HERE, "broker-statements")
 
-# Common non-US exchange suffixes on Yahoo Finance, in rough order of likelihood
-# for a European retail portfolio. Used to suggest fixes for tickers that XTB /
-# eToro export without an exchange qualifier.
-SUFFIX_CANDIDATES = [
-    ".DE", ".L", ".AS", ".PA", ".MI", ".SW", ".VI", ".MC",
-    ".BR", ".HE", ".ST", ".CO", ".OL", ".LS", ".F", ".IR",
-]
+# Common Yahoo exchange suffixes for a European retail portfolio
+SUFFIX_CANDIDATES = [".DE", ".L", ".AS", ".PA", ".MI", ".SW", ".VI", ".MC",
+                     ".BR", ".HE", ".ST", ".CO", ".OL", ".LS", ".F", ".IR"]
 
 
-def _probe_yahoo(symbol: str) -> float | None:
-    """Return a last close price for symbol, or None if Yahoo has no data."""
+def _probe_yahoo(symbol: str):
+    """(last close, currency) for a Yahoo symbol, or None if it has no data."""
     try:
-        hist = yf.Ticker(symbol).history(period="5d")
-        if hist is not None and not hist.empty and "Close" in hist:
-            s = hist["Close"].dropna()
-            if not s.empty:
-                return float(s.iloc[-1])
-    except Exception:
+        t = yf.Ticker(symbol)
+        hist = t.history(period="5d")
+        if hist is not None and not hist.empty:
+            close = hist["Close"].dropna()
+            if not close.empty:
+                return float(close.iloc[-1]), t.fast_info["currency"]
+    except Exception:  # yfinance raises many error types for unknown symbols
         pass
     return None
 
 
-def _probe_coingecko(ticker: str) -> float | None:
-    cg_id = COINGECKO_ID_MAP.get(ticker, ticker.lower())
-    try:
-        resp = requests.get(
-            f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=eur",
-            timeout=10,
-        )
-        price = resp.json().get(cg_id, {}).get("eur")
-        return float(price) if price is not None else None
-    except Exception:
-        return None
-
-
 def build_report(do_probe: bool = True) -> dict:
-    # 1. Parse everything through the real app loader
-    transactions = app.load_all_transactions()
-    parsing_errors = list(app.parsing_errors)
-    source_counts = dict(app.source_counts)
+    loaded = load_statements(TX_DIR)
+    portfolio = compute_portfolio(loaded.transactions)
+    open_keys = {p["key"] for p in portfolio["positions"]}
 
-    # 2. Collect unique tickers + source map
-    source_map = {}
-    for t in transactions:
-        source_map.setdefault(t["ticker"], t["source"])
-
-    tickers = sorted({t["ticker"] for t in transactions if t["ticker"] != "CASH"})
-
-    stocks_ok, stocks_fail = {}, {}
-    crypto_ok, crypto_fail = {}, {}
+    problems = [dict(p, open=p["key"] in open_keys) for p in portfolio["price_report"]
+                if p["status"] in ("missing", "rejected")]
     suggestions = {}
+    if do_probe:
+        for p in problems:
+            # A split-adjusted feed is the right instrument — another listing won't help.
+            if p["asset_class"] != "Stock/ETF" or p["ticker"] in suggestions or "split" in p["note"]:
+                continue
+            base = p["ticker"].replace(".", "-")
+            for suf in SUFFIX_CANDIDATES:
+                hit = _probe_yahoo(base + suf)
+                if hit:
+                    suggestions[p["ticker"]] = {"symbol": base + suf, "price": hit[0], "currency": hit[1]}
+                    break
 
-    for tk in tickers:
-        cls = classify_asset(tk, source_map.get(tk, ""))
-        if cls == "Crypto":
-            price = _probe_coingecko(tk)
-            (crypto_ok if price else crypto_fail)[tk] = price
-        else:
-            price = _probe_yahoo(tk)
-            if price:
-                stocks_ok[tk] = price
-            else:
-                stocks_fail[tk] = None
-                if do_probe:
-                    for suf in SUFFIX_CANDIDATES:
-                        alt = tk + suf
-                        p = _probe_yahoo(alt)
-                        if p:
-                            suggestions[tk] = {"symbol": alt, "price": p}
-                            break
-
-    # 3. Benchmark check
-    today = date.today().isoformat()
-    first_date = min((t["date"] for t in transactions), default=None)
-    bench_start = first_date.date().isoformat() if first_date else "2020-01-01"
-    bench = get_benchmark_series(bench_start, today)
-    benchmark_ok = len(bench) > 0
-
+    bench_ok = any(v is not None for v in portfolio["charts"]["benchmark"])
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "totals": {
-            "files_with_errors": len(parsing_errors),
-            "transactions_parsed": len(transactions),
-            "source_counts": source_counts,
-            "type_counts": dict(Counter(t["type"] for t in transactions)),
-            "unique_tickers": len(tickers),
+            "files": len(loaded.files),
+            "files_with_errors": len(loaded.errors),
+            "transactions": len(loaded.transactions),
+            "source_counts": dict(loaded.source_counts),
+            "type_counts": dict(Counter(t["type"] for t in loaded.transactions)),
+            "holdings_ever": len(portfolio["price_report"]),
+            "holdings_open": len(open_keys),
         },
-        "parsing_errors": parsing_errors,
-        "price_resolution": {
-            "stocks_ok": stocks_ok,
-            "stocks_failed": sorted(stocks_fail.keys()),
-            "crypto_ok": crypto_ok,
-            "crypto_failed": sorted(crypto_fail.keys()),
-            "suggested_symbols": suggestions,
-        },
-        "benchmark": {"ok": benchmark_ok, "points": len(bench), "range": [bench_start, today]},
-        "_source_map": source_map,
+        "files": loaded.files,
+        "parsing_errors": loaded.errors,
+        "warnings": list(loaded.warnings) + list(portfolio["warnings"]),
+        "price_problems": problems,
+        "price_report": portfolio["price_report"],
+        "suggested_symbols": suggestions,
+        "benchmark": {"ok": bench_ok, "label": portfolio["meta"].get("benchmark")},
     }
 
 
 def render_markdown(rep: dict) -> str:
     t = rep["totals"]
-    pr = rep["price_resolution"]
-    lines = []
-    lines.append("# Portfolio Processing Diagnostics")
-    lines.append("")
-    lines.append(f"_Generated: {rep['generated_at']}_")
-    lines.append("")
+    out = ["# Portfolio Processing Diagnostics", "", f"_Generated: {rep['generated_at']}_", "",
+           "## Summary", "",
+           f"- Files: **{t['files']}** parsed, **{t['files_with_errors']}** with errors",
+           f"- Transactions after merging: **{t['transactions']}**",
+           f"- By broker (files): {', '.join(f'{k}={v}' for k, v in t['source_counts'].items())}",
+           f"- Holdings: **{t['holdings_open']}** open of {t['holdings_ever']} ever held",
+           f"- Price problems: **{len(rep['price_problems'])}** "
+           f"({sum(p['open'] for p in rep['price_problems'])} affect open holdings)",
+           f"- Benchmark: **{'OK' if rep['benchmark']['ok'] else 'FAILED'}** ({rep['benchmark']['label']})",
+           ""]
 
-    # Summary
-    lines.append("## Summary")
-    lines.append("")
-    lines.append(f"- Transactions parsed: **{t['transactions_parsed']}**")
-    lines.append(f"- By broker: {', '.join(f'{k}={v}' for k, v in t['source_counts'].items())}")
-    lines.append(f"- Unique tickers: **{t['unique_tickers']}**")
-    lines.append(f"- Files with errors: **{t['files_with_errors']}**")
-    lines.append(f"- Stocks unresolved: **{len(pr['stocks_failed'])}**, "
-                 f"Crypto unresolved: **{len(pr['crypto_failed'])}**")
-    lines.append(f"- Benchmark (S&P 500): **{'OK' if rep['benchmark']['ok'] else 'FAILED'}** "
-                 f"({rep['benchmark']['points']} points)")
-    lines.append("")
-
-    # File errors
-    lines.append("## 1. File parsing errors")
-    lines.append("")
+    out += ["## 1. File parsing errors", ""]
     if rep["parsing_errors"]:
-        lines.append("| File | Error |")
-        lines.append("|------|-------|")
-        for e in rep["parsing_errors"]:
-            lines.append(f"| `{e['file']}` | {e['error']} |")
+        out += ["| File | Error |", "|------|-------|"]
+        out += [f"| `{e['file']}` | {e['error']} |" for e in rep["parsing_errors"]]
     else:
-        lines.append("None. Every file in broker-statements/ parsed cleanly.")
-    lines.append("")
+        out.append("None. Every file in broker-statements/ parsed cleanly.")
+    out.append("")
 
-    # Unresolved stocks + suggestions
-    lines.append("## 2. Unresolved stock tickers")
-    lines.append("")
-    if pr["stocks_failed"]:
-        lines.append("These tickers returned no price from Yahoo. The usual cause is a "
-                     "missing exchange suffix (XTB/eToro export e.g. `RHM` for the Frankfurt "
-                     "listing `RHM.DE`). Suggested working symbols are probed automatically.")
-        lines.append("")
-        lines.append("| Ticker | Broker | Suggested Yahoo symbol | Probed price |")
-        lines.append("|--------|--------|------------------------|--------------|")
-        for tk in pr["stocks_failed"]:
-            src = rep["_source_map"].get(tk, "?")
-            sug = pr["suggested_symbols"].get(tk)
-            if sug:
-                lines.append(f"| {tk} | {src} | **{sug['symbol']}** | {sug['price']:.2f} |")
-            else:
-                lines.append(f"| {tk} | {src} | _none found_ | — |")
+    out += ["## 2. Data-quality notes", ""]
+    if rep["warnings"]:
+        out += [f"- {('`' + w['file'] + '`: ') if w.get('file') else ''}{w['message']}" for w in rep["warnings"]]
     else:
-        lines.append("None. All stock tickers resolved.")
-    lines.append("")
+        out.append("None.")
+    out.append("")
 
-    # Unresolved crypto
-    lines.append("## 3. Unresolved crypto tickers")
-    lines.append("")
-    if pr["crypto_failed"]:
-        lines.append("These crypto symbols are not in the CoinGecko id map "
-                     "(engine/prices.py COINGECKO_ID_MAP). Add the mapping to fix.")
-        lines.append("")
-        for tk in pr["crypto_failed"]:
-            lines.append(f"- `{tk}` ({rep['_source_map'].get(tk, '?')})")
+    out += ["## 3. Holdings without a usable price feed", ""]
+    if rep["price_problems"]:
+        out += ["These holdings are valued at their last trade/statement price instead of a live quote.",
+                "", "| Holding | Open | Class | Symbol tried | Status | Note | Suggested symbol |",
+                "|---------|------|-------|--------------|--------|------|------------------|"]
+        for p in rep["price_problems"]:
+            sug = rep["suggested_symbols"].get(p["ticker"])
+            sug_s = f"**{sug['symbol']}** ({sug['price']:.2f} {sug['currency']})" if sug else "—"
+            out.append(f"| {p['ticker']} ({p['source']}) | {'yes' if p['open'] else 'no'} | "
+                       f"{p['asset_class']} | `{p['symbol']}` | {p['status']} | {p['note']} | {sug_s} |")
     else:
-        lines.append("None. All crypto tickers resolved.")
-    lines.append("")
+        out.append("None. Every holding has a validated price feed.")
+    out.append("")
 
-    # Benchmark
-    lines.append("## 4. Benchmark feed")
-    lines.append("")
-    b = rep["benchmark"]
-    if b["ok"]:
-        lines.append(f"Loaded {b['points']} daily points for {b['range'][0]} → {b['range'][1]}.")
-    else:
-        lines.append("FAILED to load. The S&P 500 line will be empty on the chart. "
-                     "Yahoo's `^GSPC` index endpoint commonly times out or rate-limits; "
-                     "the engine falls back to SPY/VOO. Re-running usually succeeds.")
-    lines.append("")
-
-    lines.append("---")
-    lines.append("")
-    lines.append("### How to apply ticker fixes")
-    lines.append("")
-    lines.append("Add confirmed symbols to a ticker override map in `engine/prices.py` "
-                 "so the dashboard fetches the right listing (e.g. `RHM` → `RHM.DE`).")
-    lines.append("")
-    return "\n".join(lines)
+    out += ["## 4. Benchmark feed", ""]
+    out.append(f"Loaded: {rep['benchmark']['label']}." if rep["benchmark"]["ok"] else
+               "FAILED to load — Yahoo commonly rate-limits; the engine tries ^SP500TR, SPY and "
+               "^GSPC in turn. Re-running usually succeeds.")
+    out += ["", "---", "", "### How to fix a wrong or missing symbol", "",
+            f"Create `{os.path.basename(OVERRIDES_PATH)}` in the project root, e.g. "
+            "`{\"RHM\": \"RHM.DE\", \"Bitpanda:BEST\": null}` (null disables the feed). "
+            "Keys are `TICKER` or `Broker:TICKER`. Then press Reload in the dashboard.", ""]
+    return "\n".join(out)
 
 
 def main():
@@ -232,27 +162,23 @@ def main():
                     help="Skip the exchange-suffix probe (faster, no fix suggestions).")
     args = ap.parse_args()
 
-    print("Running diagnostics (this fetches live prices, may take a minute)...")
+    print("Running diagnostics (fetches live prices, may take a minute)...")
     report = build_report(do_probe=not args.no_probe)
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     md_path = os.path.join(HERE, f"diagnostics-report-{stamp}.md")
     json_path = os.path.join(HERE, f"diagnostics-report-{stamp}.json")
-
-    md = render_markdown(report)
     with open(md_path, "w", encoding="utf-8") as f:
-        f.write(md)
-    # Drop the internal source map from the JSON payload
-    report.pop("_source_map", None)
+        f.write(render_markdown(report))
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
+        json.dump(report, f, indent=2, ensure_ascii=False, default=str)
 
-    pr = report["price_resolution"]
+    t = report["totals"]
     print("\n" + "=" * 60)
-    print(f"  Transactions parsed : {report['totals']['transactions_parsed']}")
-    print(f"  File errors         : {report['totals']['files_with_errors']}")
-    print(f"  Stocks unresolved   : {len(pr['stocks_failed'])}")
-    print(f"  Crypto unresolved   : {len(pr['crypto_failed'])}")
+    print(f"  Transactions        : {t['transactions']}")
+    print(f"  File errors         : {t['files_with_errors']}")
+    print(f"  Data-quality notes  : {len(report['warnings'])}")
+    print(f"  Price problems      : {len(report['price_problems'])}")
     print(f"  Benchmark           : {'OK' if report['benchmark']['ok'] else 'FAILED'}")
     print("=" * 60)
     print(f"\nReport written to:\n  {md_path}\n  {json_path}")

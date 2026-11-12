@@ -1,8 +1,10 @@
-flask
-pandas
-openpyxl
-pyxirr
-yfinance
-requests
-numpy
-scipy
+flask>=3.0
+pandas>=2.2
+numpy>=1.26
+openpyxl>=3.1
+pyxirr>=0.10
+yfinance>=0.2.54
+requests>=2.31
+# IANA time zones for zoneinfo (XTB's old export uses Europe/Warsaw local time);
+# Windows has no system tz database
+tzdata>=2024.1

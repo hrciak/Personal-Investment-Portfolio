@@ -1,295 +1,295 @@
-import yfinance as yf
-import requests
-import pandas as pd
-from parsers.base import classify_asset
+"""
+Market data (Yahoo Finance, CoinGecko fallback)
+===============================================
 
+Everything this module hands to the engine is **EUR per unit**, as a daily
+pandas Series indexed by naive, normalized dates. That single convention is
+what lets holdings from different brokers, exchanges and currencies be summed.
+
+  * Stocks/ETFs: Yahoo daily close (split-adjusted, NOT dividend-adjusted —
+    dividends are booked separately as income, so dividend-adjusted prices
+    would count them twice). Converted from the listing's quote currency
+    (looked up once per symbol and cached, minor units such as GBp handled)
+    to EUR with Yahoo FX history.
+  * Crypto: Yahoo "<TICKER>-EUR", then "<TICKER>-USD" converted to EUR, then
+    CoinGecko for coins with an explicit id below.
+  * Benchmark: S&P 500 total return (dividends reinvested) in EUR.
+
+The engine is written against the small MarketData interface implemented by
+YahooMarketData, so tests (and offline use) can inject their own provider.
+"""
+
+import datetime as dt
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+
+import pandas as pd
+import requests
+import yfinance as yf
+
+from engine import symbols
+
+# Explicit CoinGecko ids. Only coins listed here use the CoinGecko fallback —
+# guessing an id from the ticker silently prices the wrong coin.
 COINGECKO_ID_MAP = {
     "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "ADA": "cardano",
-    "XRP": "ripple", "DOT": "polkadot", "MATIC": "matic-network", 
-    "BNB": "binancecoin", "AVAX": "avalanche-2", "LINK": "chainlink", 
+    "XRP": "ripple", "DOT": "polkadot", "MATIC": "matic-network", "POL": "polygon-ecosystem-token",
+    "BNB": "binancecoin", "AVAX": "avalanche-2", "LINK": "chainlink",
     "LTC": "litecoin", "DOGE": "dogecoin", "ATOM": "cosmos", "ALGO": "algorand",
-    "UNI": "uniswap", "AAVE": "aave", "NEAR": "near", "FTM": "fantom", 
-    "HBAR": "hedera-hashgraph", "ICP": "internet-computer", "APE": "apecoin", 
-    "EGLD": "elrond-erd-2"
+    "UNI": "uniswap", "AAVE": "aave", "NEAR": "near", "FTM": "fantom",
+    "HBAR": "hedera-hashgraph", "ICP": "internet-computer", "APE": "apecoin",
+    "EGLD": "elrond-erd-2", "AUDIO": "audius",
+    "SCRT": "secret", "OSMO": "osmosis", "LUNC": "terra-luna", "USDT": "tether",
+    "USDC": "usd-coin", "DAI": "dai",
 }
 
-# Cache at module level
-_current_prices_cache = {}
-_historical_prices_cache = {}
-_benchmark_cache = {}
+# Yahoo quotes some listings in a currency's minor unit (pence, cents).
+MINOR_UNITS = {"GBp": ("GBP", 100.0), "GBX": ("GBP", 100.0), "ZAc": ("ZAR", 100.0),
+               "ILA": ("ILS", 100.0)}
 
-def clear_cache():
-    global _current_prices_cache, _historical_prices_cache, _benchmark_cache
-    _current_prices_cache = {}
-    _historical_prices_cache = {}
-    _benchmark_cache = {}
+BENCHMARKS = [
+    ("^SP500TR", "S&P 500 Total Return"),
+    ("SPY", "S&P 500 (SPY, dividends reinvested)"),
+    ("^GSPC", "S&P 500 (price index)"),
+]
+
+_cache: dict = {}
 
 
-def _yf_crypto_eur_current(tickers: list) -> dict:
-    """Latest EUR price per crypto ticker via yfinance '<TICKER>-EUR' pairs,
-    in one batched download. Returns {ticker: price} for coins that resolved."""
+def clear_cache() -> None:
+    """Drop downloaded series and reload the symbol cache/overrides from disk."""
+    _cache.clear()
+    symbols.reset()
+
+
+@dataclass
+class PriceSeries:
+    """EUR price history for one holding."""
+    series: pd.Series                    # EUR per unit, daily (trading days only), may be empty
+    symbol: str | None = None
+    currency: str | None = None
+    notes: list = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------
+# Low-level download helpers
+# --------------------------------------------------------------------------
+
+def _normalize_index(s: pd.Series) -> pd.Series:
+    idx = pd.to_datetime(s.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    s = s.copy()
+    s.index = idx.normalize()
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    return s.astype(float)
+
+
+def _download(symbol_list, start: dt.date, end: dt.date, adjusted: bool = False) -> dict:
+    """Batched daily closes {symbol: Series}. `end` is inclusive."""
+    syms = sorted({s for s in symbol_list if s})
+    if not syms:
+        return {}
+    key = ("dl", tuple(syms), start, end, adjusted)
+    if key in _cache:
+        return _cache[key]
+
     out = {}
-    if not tickers:
-        return out
-    syms = [f"{t}-EUR" for t in tickers]
     try:
-        df = yf.download(syms, period="5d", progress=False, auto_adjust=True)
-        if df is None or df.empty or "Close" not in df:
-            return out
+        df = yf.download(syms, start=start.isoformat(), end=(end + dt.timedelta(days=1)).isoformat(),
+                         auto_adjust=adjusted, progress=False, threads=True)
+    except Exception as e:  # network / Yahoo errors must not kill the pipeline
+        print(f"prices: Yahoo download failed ({e})")
+        df = None
+    if df is not None and not df.empty:
         close = df["Close"]
-        if len(syms) == 1:
-            s = (close.iloc[:, 0] if hasattr(close, "columns") else close).dropna()
-            if not s.empty:
-                out[tickers[0]] = float(s.iloc[-1])
-        else:
-            for t in tickers:
-                sym = f"{t}-EUR"
-                if sym in close.columns:
-                    s = close[sym].dropna()
-                    if not s.empty:
-                        out[t] = float(s.iloc[-1])
-    except Exception:
-        pass
+        if isinstance(close, pd.Series):
+            close = close.to_frame(syms[0])
+        for sym in syms:
+            if sym in close.columns:
+                s = close[sym].dropna()
+                if not s.empty:
+                    out[sym] = _normalize_index(s)
+    _cache[key] = out
     return out
 
-def get_current_prices(tickers: list[str], fallback_prices: dict = None, source_map: dict = None,
-                       asset_class_map: dict = None, symbol_map: dict = None) -> dict[str, float]:
-    result = {}
-    if fallback_prices is None:
-        fallback_prices = {}
-    if source_map is None:
-        source_map = {}
-    if asset_class_map is None:
-        asset_class_map = {}
-    if symbol_map is None:
-        symbol_map = {}
 
-    to_fetch_stocks = set()
-    to_fetch_crypto = set()
+def quote_currency(symbol: str) -> str:
+    """Quote currency of a Yahoo symbol (e.g. 'USD', 'GBp'), cached on disk."""
+    key = f"ccy:{symbol}"
+    if symbols.cache_has(key):
+        return symbols.cache_get(key)
+    ccy = None
+    try:
+        ccy = yf.Ticker(symbol).fast_info["currency"]
+    except Exception:  # yfinance raises a variety of errors for unknown symbols
+        ccy = None
+    if ccy:
+        symbols.cache_set(key, ccy)
+        return ccy
+    return symbols.guess_currency(symbol)
 
-    for t in tickers:
-        if t in _current_prices_cache:
-            result[t] = _current_prices_cache[t]
+
+def _quote_currencies(symbol_list) -> dict:
+    syms = sorted(set(symbol_list))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return dict(zip(syms, pool.map(quote_currency, syms)))
+
+
+def eur_per_unit(currencies, start: dt.date, end: dt.date) -> dict:
+    """{currency: daily Series of EUR per 1 unit of that currency}, calendar
+    days, forward/back-filled. Minor units (GBp) are already divided out."""
+    majors = {MINOR_UNITS.get(c, (c, 1.0))[0] for c in currencies if c} - {"EUR"}
+    fx_syms = {f"EUR{m}=X": m for m in majors}
+    closes = _download(list(fx_syms), start - dt.timedelta(days=10), end)
+    days = pd.date_range(start - dt.timedelta(days=10), end, freq="D")
+
+    per_major = {"EUR": pd.Series(1.0, index=days)}
+    for sym, major in fx_syms.items():
+        s = closes.get(sym)
+        if s is not None and not s.empty:
+            per_major[major] = (1.0 / s).reindex(days).ffill().bfill()
+
+    out = {}
+    for c in currencies:
+        if not c:
             continue
+        major, factor = MINOR_UNITS.get(c, (c, 1.0))
+        if major in per_major:
+            out[c] = per_major[major] / factor
+    return out
 
-        asset_type = classify_asset(t, source_map.get(t, ""), asset_class_map.get(t, ""))
-        if asset_type == "Cash":
-            result[t] = 1.0
-            _current_prices_cache[t] = 1.0
-        elif asset_type == "Crypto":
-            to_fetch_crypto.add(t)
-        else:
-            to_fetch_stocks.add(t)
 
-    # Fetch Crypto.
-    # Primary: yfinance "<TICKER>-EUR" pairs in ONE batched call. This is robust
-    # and does not share CoinGecko's free-tier rate limit (which the per-coin
-    # history calls exhaust, previously forcing every coin to fall back to its
-    # average cost). CoinGecko is the fallback for any coin yfinance lacks.
-    if to_fetch_crypto:
-        crypto_list = list(to_fetch_crypto)
-        got = _yf_crypto_eur_current(crypto_list)
+def _to_eur(series: pd.Series, currency: str, fx: dict):
+    """Convert a local-currency series to EUR, or None if FX is unavailable."""
+    if currency == "EUR":
+        return series
+    rate = fx.get(currency)
+    if rate is None:
+        return None
+    return (series * rate.reindex(series.index).ffill().bfill()).dropna()
 
-        missing = [t for t in crypto_list if t not in got]
-        if missing:
-            cg_ids = {t: COINGECKO_ID_MAP.get(t, t.lower()) for t in missing}
-            try:
-                resp = requests.get(
-                    f"https://api.coingecko.com/api/v3/simple/price?ids={','.join(cg_ids.values())}&vs_currencies=eur",
-                    timeout=10)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for t in missing:
-                        price = data.get(cg_ids[t], {}).get("eur")
-                        if price is not None:
-                            got[t] = float(price)
-            except Exception:
-                pass
 
-        for t in crypto_list:
-            result[t] = got.get(t, fallback_prices.get(t, 0.0))
-            _current_prices_cache[t] = result[t]
+def _coingecko_history(coin_id: str, start: dt.date, end: dt.date) -> pd.Series:
+    """Daily EUR history from CoinGecko (free tier: last 365 days only)."""
+    days = max(1, min((end - start).days + 1, 365))
+    try:
+        resp = requests.get(f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
+                            params={"vs_currency": "eur", "days": days}, timeout=10)
+        resp.raise_for_status()
+        prices = resp.json().get("prices") or []
+    except (requests.RequestException, ValueError) as e:
+        print(f"prices: CoinGecko history failed for {coin_id} ({e})")
+        return pd.Series(dtype=float)
+    if not prices:
+        return pd.Series(dtype=float)
+    df = pd.DataFrame(prices, columns=["ts", "price"])
+    df["date"] = pd.to_datetime(df["ts"], unit="ms").dt.normalize()
+    return df.groupby("date")["price"].last().astype(float)
 
-    # Fetch Stocks, using the resolved Yahoo symbol (e.g. VUSA -> VUSA.L) while
-    # keeping results keyed by the original ticker. Missing prices fall back to
-    # cost basis so a holding never shows as a total loss.
-    if to_fetch_stocks:
-        stock_list = list(to_fetch_stocks)
-        sym_for = {t: (symbol_map.get(t) or t) for t in stock_list}
-        dl_syms = sorted({s for s in sym_for.values() if s})
-        prices_by_sym = {}
-        try:
-            df = yf.download(dl_syms, period="5d", progress=False, auto_adjust=True)
-            if df is not None and not df.empty and "Close" in df:
-                close = df["Close"]
-                if hasattr(close, "columns"):
-                    for sym in dl_syms:
-                        if sym in close.columns:
-                            s = close[sym].dropna()
-                            if not s.empty:
-                                prices_by_sym[sym] = float(s.iloc[-1])
-                else:  # single symbol -> Close is a Series
-                    s = close.dropna()
-                    if not s.empty and dl_syms:
-                        prices_by_sym[dl_syms[0]] = float(s.iloc[-1])
-        except Exception:
-            pass
 
-        for t in stock_list:
-            price = prices_by_sym.get(sym_for[t])
-            result[t] = price if price is not None else fallback_prices.get(t, 0.0)
-            _current_prices_cache[t] = result[t]
+# --------------------------------------------------------------------------
+# Public provider
+# --------------------------------------------------------------------------
 
-    return result
+class YahooMarketData:
+    """Default MarketData implementation.
 
-def get_benchmark_series(start_date: str, end_date: str) -> dict[str, float]:
-    cache_key = f"{start_date}_{end_date}"
-    if cache_key in _benchmark_cache:
-        return _benchmark_cache[cache_key]
+    daily_prices_eur(instruments, start, end) -> {key: PriceSeries}
+        instruments: dicts with key, ticker, source, asset_class, isin, raw_symbol
+    benchmark_eur(start, end) -> (Series of EUR values or None, label)
+    """
 
-    # ^GSPC (the index) frequently times out / rate-limits on Yahoo. Try it first,
-    # then fall back to liquid S&P 500 ETFs which resolve far more reliably.
-    for symbol in ("^GSPC", "SPY", "^SPX", "VOO"):
-        for attempt in range(2):
-            try:
-                df = yf.download(symbol, start=start_date, end=end_date,
-                                 progress=False, auto_adjust=True)
-                if df is None or df.empty or "Close" not in df:
-                    continue
-                close_series = df["Close"]
-                # Single-ticker downloads can come back as a 1-col DataFrame
-                if hasattr(close_series, "columns"):
-                    close_series = close_series.iloc[:, 0]
-                close_series = close_series.dropna()
-                if close_series.empty:
-                    continue
-
-                # Normalize to base 100
-                first_val = float(close_series.iloc[0])
-                if first_val == 0:
-                    continue
-                series_dict = {str(idx.date()): (float(val) / first_val * 100)
-                               for idx, val in close_series.items()}
-                _benchmark_cache[cache_key] = series_dict
-                print(f"Benchmark loaded from {symbol} ({len(series_dict)} points)")
-                return series_dict
-            except Exception as e:
-                print(f"Benchmark fetch failed for {symbol} (attempt {attempt + 1}): {e}")
+    def daily_prices_eur(self, instruments: list, start: dt.date, end: dt.date) -> dict:
+        result = {}
+        crypto, stocks = [], []
+        for inst in instruments:
+            if inst["asset_class"] == "Cash":
+                result[inst["key"]] = PriceSeries(pd.Series(dtype=float), None, "EUR", ["cash"])
                 continue
-
-    print("Benchmark: all symbols failed; S&P 500 line will be empty.")
-    _benchmark_cache[cache_key] = {}
-    return {}
-
-def get_historical_prices(tickers: list[str], start_date: str, end_date: str, source_map: dict = None,
-                          asset_class_map: dict = None, symbol_map: dict = None) -> dict[str, pd.Series]:
-    if source_map is None:
-        source_map = {}
-    if asset_class_map is None:
-        asset_class_map = {}
-    if symbol_map is None:
-        symbol_map = {}
-
-    result = {}
-    to_fetch_stocks = set()
-    to_fetch_crypto = set()
-
-    start_dt = pd.to_datetime(start_date)
-    end_dt = pd.to_datetime(end_date)
-    days = (end_dt - start_dt).days
-    if days <= 0:
-        days = 1
-
-    for t in tickers:
-        cache_key = f"{t}_{start_date}_{end_date}"
-        if cache_key in _historical_prices_cache:
-            result[t] = _historical_prices_cache[cache_key]
-            continue
-
-        asset_type = classify_asset(t, source_map.get(t, ""), asset_class_map.get(t, ""))
-        if asset_type == "Cash":
-            # Cash is always 1.0, create a series
-            idx = pd.date_range(start=start_dt, end=end_dt, freq='D')
-            result[t] = pd.Series(1.0, index=idx)
-        elif asset_type == "Crypto":
-            to_fetch_crypto.add(t)
-        else:
-            to_fetch_stocks.add(t)
-
-    # Fetch Crypto history.
-    # Primary: yfinance "<TICKER>-EUR" in ONE batched call (no per-coin CoinGecko
-    # requests, which used to exhaust the free-tier rate limit). CoinGecko's
-    # per-coin market_chart is the fallback for coins yfinance does not cover.
-    if to_fetch_crypto:
-        crypto_list = list(to_fetch_crypto)
-        resolved = set()
-        try:
-            syms = [f"{t}-EUR" for t in crypto_list]
-            cdf = yf.download(syms, start=start_date, end=end_date, progress=False, auto_adjust=True)
-            if cdf is not None and not cdf.empty and "Close" in cdf:
-                close_df = cdf["Close"]
-                for t in crypto_list:
-                    sym = f"{t}-EUR"
-                    series = None
-                    if len(syms) == 1:
-                        series = (close_df.iloc[:, 0] if hasattr(close_df, "columns") else close_df).dropna()
-                    elif hasattr(close_df, "columns") and sym in close_df.columns:
-                        series = close_df[sym].dropna()
-                    if series is not None and not series.empty:
-                        series.index = series.index.normalize()
-                        result[t] = series
-                        _historical_prices_cache[f"{t}_{start_date}_{end_date}"] = series
-                        resolved.add(t)
-        except Exception:
-            pass
-
-        for t in crypto_list:
-            if t in resolved:
+            sym = symbols.resolve_symbol(inst["ticker"], inst.get("isin"), inst.get("raw_symbol"),
+                                         inst.get("source", ""), inst["asset_class"])
+            if sym is None:
+                result[inst["key"]] = PriceSeries(pd.Series(dtype=float), None, None,
+                                                  ["price feed disabled in symbol_overrides.json"])
                 continue
-            cg_id = COINGECKO_ID_MAP.get(t, t.lower())
-            try:
-                resp = requests.get(f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart?vs_currency=eur&days={days}", timeout=10)
-                if resp.status_code == 200 and "prices" in resp.json():
-                    data = resp.json()
-                    df = pd.DataFrame(data["prices"], columns=["timestamp", "price"])
-                    df["date"] = pd.to_datetime(df["timestamp"], unit="ms").dt.normalize()
-                    daily = df.groupby("date")["price"].last()
-                    result[t] = daily
-                    _historical_prices_cache[f"{t}_{start_date}_{end_date}"] = daily
-                else:
-                    result[t] = pd.Series(dtype=float)
-            except Exception:
-                result[t] = pd.Series(dtype=float)
+            (crypto if inst["asset_class"] == "Crypto" else stocks).append((inst, sym))
 
-    # Fetch Stocks history using resolved Yahoo symbols, keyed back to ticker.
-    if to_fetch_stocks:
-        stock_list = list(to_fetch_stocks)
-        sym_for = {t: (symbol_map.get(t) or t) for t in stock_list}
-        dl_syms = sorted({s for s in sym_for.values() if s})
-        series_by_sym = {}
-        try:
-            df = yf.download(dl_syms, start=start_date, end=end_date, progress=False, auto_adjust=True)
-            if df is not None and not df.empty and "Close" in df:
-                close_df = df["Close"]
-                if hasattr(close_df, "columns"):
-                    for sym in dl_syms:
-                        if sym in close_df.columns:
-                            s = close_df[sym].dropna()
-                            if not s.empty:
-                                s.index = s.index.normalize()
-                                series_by_sym[sym] = s
-                else:  # single symbol
-                    s = close_df.dropna()
-                    if not s.empty and dl_syms:
-                        s.index = s.index.normalize()
-                        series_by_sym[dl_syms[0]] = s
-        except Exception:
-            pass
+        fetch_start = start - dt.timedelta(days=10)  # lets the first day forward-fill
+        result.update(self._stocks(stocks, fetch_start, end))
+        result.update(self._crypto(crypto, fetch_start, end))
+        return result
 
-        for t in stock_list:
-            s = series_by_sym.get(sym_for[t])
-            result[t] = s if s is not None else pd.Series(dtype=float)
-            if s is not None:
-                _historical_prices_cache[f"{t}_{start_date}_{end_date}"] = s
+    def _stocks(self, items, start, end) -> dict:
+        out = {}
+        if not items:
+            return out
+        closes = _download([s for _, s in items], start, end)
+        missing = [s for _, s in items if s not in closes]
+        if missing:  # one retry: Yahoo batch downloads drop symbols sporadically
+            closes.update(_download(missing, start, end))
+        ccys = _quote_currencies([s for _, s in items if s in closes])
+        fx = eur_per_unit(set(ccys.values()), start, end)
+        for inst, sym in items:
+            raw = closes.get(sym)
+            if raw is None:
+                out[inst["key"]] = PriceSeries(pd.Series(dtype=float), sym, None,
+                                               [f"no Yahoo data for {sym}"])
+                continue
+            ccy = ccys.get(sym) or symbols.guess_currency(sym)
+            eur = _to_eur(raw, ccy, fx)
+            if eur is None:
+                out[inst["key"]] = PriceSeries(pd.Series(dtype=float), sym, ccy,
+                                               [f"no FX rate for {ccy}"])
+            else:
+                out[inst["key"]] = PriceSeries(eur, sym, ccy)
+        return out
 
-    return result
+    def _crypto(self, items, start, end) -> dict:
+        out = {}
+        if not items:
+            return out
+        closes = _download([s for _, s in items], start, end)
+        usd_alt = {}
+        for inst, sym in items:
+            if sym not in closes and sym.endswith("-EUR"):
+                usd_alt[sym] = sym[:-4] + "-USD"
+        usd_closes = _download(list(usd_alt.values()), start, end) if usd_alt else {}
+        fx = eur_per_unit({"USD"}, start, end) if usd_closes else {}
+
+        for inst, sym in items:
+            key = inst["key"]
+            if sym in closes:
+                out[key] = PriceSeries(closes[sym], sym, "EUR")
+                continue
+            alt = usd_alt.get(sym)
+            if alt and alt in usd_closes:
+                eur = _to_eur(usd_closes[alt], "USD", fx)
+                if eur is not None and not eur.empty:
+                    out[key] = PriceSeries(eur, alt, "USD", [f"{sym} unavailable, used {alt}"])
+                    continue
+            coin_id = COINGECKO_ID_MAP.get(inst["ticker"].upper())
+            if coin_id:
+                s = _coingecko_history(coin_id, start, end)
+                if not s.empty:
+                    out[key] = PriceSeries(s, f"coingecko:{coin_id}", "EUR",
+                                           ["CoinGecko (history limited to 365 days)"])
+                    continue
+            out[key] = PriceSeries(pd.Series(dtype=float), sym, None,
+                                   [f"no price data for {sym}"])
+        return out
+
+    def benchmark_eur(self, start: dt.date, end: dt.date):
+        fetch_start = start - dt.timedelta(days=10)
+        fx = None
+        for sym, label in BENCHMARKS:
+            s = _download([sym], fetch_start, end, adjusted=True).get(sym)
+            if s is None or s.empty:
+                continue
+            if fx is None:
+                fx = eur_per_unit({"USD"}, fetch_start, end)
+            eur = _to_eur(s, "USD", fx)
+            if eur is not None and not eur.empty:
+                return eur, f"{label} in EUR"
+        print("prices: all benchmark symbols failed; S&P 500 line will be empty.")
+        return None, "S&P 500 (unavailable)"

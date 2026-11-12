@@ -16,6 +16,9 @@ static/conai-brain-logo.png
 # Resolved-symbol cache (rebuilds itself from statements)
 symbol_cache.json
 
+# Personal symbol overrides (names your holdings)
+symbol_overrides.json
+
 # Python cache & compiled files
 __pycache__/
 *.pyc

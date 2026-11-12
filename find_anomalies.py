@@ -3,117 +3,64 @@
 Valuation anomaly scanner
 =========================
 
-Finds tickers whose fetched price is implausible relative to what was actually
-paid for them — the signature of a wrong-instrument ticker collision (e.g. a
-Bitpanda micro-cap token whose symbol also exists as a NYSE stock) or a one-day
-data glitch. These produce the giant spikes seen on the performance chart once
-closed positions are valued historically.
+Shows how the engine judged every price feed. Each feed is validated against
+the prices actually paid/received in the statements (median feed/trade price
+ratio): a ratio far from 1 is the signature of a wrong-instrument symbol
+collision (e.g. a Bitpanda micro-cap token whose symbol is also a NYSE stock)
+or a wrong unit (pence vs pounds). Rejected feeds are not used — the holding
+is valued at its last trade price instead — so they cannot spike the chart.
 
-Reports, per suspicious ticker: source, asset class, max quantity held, average
-cost paid, the peak fetched price, the cost multiple, the resulting peak market
-value, and the date of the peak — so the bad points can be filtered.
+Listed per holding: status, validation ratio, symbol, quote currency, note.
+Also reports days whose daily return was capped as a data glitch.
 
 Run with the project venv:  python find_anomalies.py
 """
 
 import os
 import sys
-import datetime
-from collections import defaultdict
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
+except (AttributeError, ValueError):
     pass
 
-import app
-from parsers.base import classify_asset
-from engine.prices import get_historical_prices
+from parsers import load_statements
+from engine import compute_portfolio
 
-PRICE_COST_MULT = 25.0     # price > this x avg cost  -> suspicious
-MIN_PEAK_MV = 300.0        # ignore tiny positions that can't distort the chart
-
-
-def load():
-    txs = app.load_all_transactions()
-    seen, dd = set(), []
-    for t in txs:
-        dtag = t["date"].isoformat() if hasattr(t["date"], "isoformat") else str(t["date"])
-        sig = f'{dtag}|{t["ticker"]}|{t["type"]}|{t["qty"]}|{t["price"]}'
-        if sig not in seen:
-            seen.add(sig)
-            dd.append(t)
-    return dd
+TX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "broker-statements")
 
 
 def main():
-    dd = load()
-    bought_val = defaultdict(float)
-    bought_qty = defaultdict(float)
-    run_qty = defaultdict(float)
-    max_qty = defaultdict(float)
-    source = {}
-    first_date = None
-
-    for t in sorted(dd, key=lambda x: x["date"]):
-        tk = t["ticker"]
-        source.setdefault(tk, t["source"])
-        if first_date is None:
-            first_date = t["date"]
-        if t["type"] == "BUY":
-            bought_val[tk] += t["qty"] * t["price"] + t["fee"]
-            bought_qty[tk] += t["qty"]
-            run_qty[tk] += t["qty"]
-        elif t["type"] == "SELL":
-            run_qty[tk] -= t["qty"]
-        max_qty[tk] = max(max_qty[tk], run_qty[tk])
-
-    tickers = [tk for tk in bought_qty if tk != "CASH"]
-    start = first_date.date().isoformat() if hasattr(first_date, "date") else str(first_date)[:10]
-    today = datetime.date.today().isoformat()
-    smap = {tk: source.get(tk, "") for tk in tickers}
-
-    print(f"Fetching price history for {len(tickers)} tickers ...")
-    hist = get_historical_prices(tickers, start, today, smap)
-
-    rows = []
-    for tk in tickers:
-        ps = hist.get(tk)
-        if ps is None or len(ps) == 0:
-            continue
-        avg_cost = bought_val[tk] / bought_qty[tk] if bought_qty[tk] > 0 else 0.0
-        pmax = float(ps.max())
-        try:
-            dmax = str(ps.idxmax().date())
-        except Exception:
-            dmax = str(ps.idxmax())
-        cls = classify_asset(tk, smap.get(tk, ""))
-        mult = (pmax / avg_cost) if avg_cost > 0 else float("inf")
-        peak_mv = pmax * max_qty[tk]
-        if avg_cost > 0 and mult > PRICE_COST_MULT and peak_mv > MIN_PEAK_MV:
-            rows.append((peak_mv, tk, source.get(tk), cls, max_qty[tk], avg_cost, pmax, mult, dmax))
-
-    rows.sort(reverse=True)
-    print("\n" + "=" * 96)
-    print("SUSPICIOUS VALUATIONS  (fetched price >> price actually paid)")
-    print("=" * 96)
-    if not rows:
-        print("None found. No ticker is priced more than "
-              f"{PRICE_COST_MULT:.0f}x its average cost.")
+    loaded = load_statements(TX_DIR)
+    if not loaded.transactions:
+        print("No transactions found.")
         return
-    print(f"{'ticker':<8}{'source':<10}{'class':<10}{'maxQty':>15}{'avgCost':>11}"
-          f"{'peakPrice':>12}{'xCost':>8}{'peakMV(EUR)':>14}  peakDate")
-    print("-" * 96)
-    for mv, tk, src, cls, mq, ac, pm, mult, dm in rows:
-        mults = f"{mult:>8.0f}" if mult != float("inf") else f"{'inf':>8}"
-        print(f"{tk:<8}{str(src):<10}{cls:<10}{mq:>15.4f}{ac:>11.4f}"
-              f"{pm:>12.2f}{mults}{mv:>14,.0f}  {dm}")
-    print("-" * 96)
-    print(f"{len(rows)} ticker(s) flagged. These are almost certainly wrong-instrument")
-    print("matches on Yahoo (the symbol collides with an unrelated stock) or one-off data")
-    print("glitches. The engine now caps any historical price above "
-          f"{PRICE_COST_MULT:.0f}x a position's average")
-    print("cost, falling back to cost basis, so they no longer distort the chart.")
+    print("Fetching price history and validating feeds ...")
+    portfolio = compute_portfolio(loaded.transactions)
+    open_keys = {p["key"] for p in portfolio["positions"]}
+    rows = portfolio["price_report"]
+
+    flagged = [r for r in rows if r["status"] in ("rejected", "missing")
+               or (r["validation_ratio"] is not None and not 0.8 <= r["validation_ratio"] <= 1.25)]
+    print("\n" + "=" * 100)
+    print("PRICE FEED VALIDATION  (ratio = feed price / price actually traded, median)")
+    print("=" * 100)
+    print(f"{'holding':<24}{'open':<6}{'status':<10}{'ratio':>8}  {'symbol':<18}{'ccy':<6}note")
+    print("-" * 100)
+    for r in sorted(flagged, key=lambda x: (x["status"], x["key"])):
+        ratio = f"{r['validation_ratio']:.3g}" if r["validation_ratio"] is not None else "—"
+        print(f"{r['key']:<24}{'yes' if r['key'] in open_keys else 'no':<6}{r['status']:<10}"
+              f"{ratio:>8}  {str(r['symbol']):<18}{str(r['currency']):<6}{r['note']}")
+    if not flagged:
+        print("No anomalies: every feed matches the traded prices.")
+    print("-" * 100)
+    ok = sum(r["status"] == "ok" for r in rows)
+    print(f"{ok}/{len(rows)} feeds accepted; {len(flagged)} flagged "
+          "(rejected/missing feeds fall back to the last trade price).")
+    capped = portfolio["meta"].get("capped_return_days", 0)
+    if capped:
+        print(f"{capped} day(s) had an implausible daily portfolio return and were capped.")
+    print("Fix a wrong symbol with symbol_overrides.json (see engine/symbols.py).")
 
 
 if __name__ == "__main__":

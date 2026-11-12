@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-Portfolio performance visualization builder (PIPD)
-==================================================
+Portfolio performance report (PIPD)
+===================================
 
-Reads the broker statements, computes monthly performance metrics
-(Absolute wealth + Time-Weighted Return vs. S&P 500), prints an audit
-table, and writes a self-contained interactive chart to
-portfolio_performance.html.
+Loads the broker statements, runs the same engine as the dashboard, samples
+its daily series at month-ends, prints an audit table and writes a
+self-contained interactive chart to portfolio_performance.html (gitignored).
+
+Every number here comes from engine.compute_portfolio, so the report always
+agrees with the dashboard:
+  * portfolio value      — daily mark-to-market valuation in EUR
+  * net contributions    — deposits − withdrawals (+ in-kind transfers at FMV)
+  * TWR index            — flow-neutral daily time-weighted return, base 100
+  * benchmark            — S&P 500 total return converted to EUR, base 100
+  * MWR                  — XIRR on external cash flows
 
 Run with the project venv:  python build_performance.py
 """
@@ -14,358 +21,183 @@ Run with the project venv:  python build_performance.py
 import os
 import sys
 import json
-from collections import defaultdict
-from datetime import datetime, date
+from datetime import datetime
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
+except (AttributeError, ValueError):
     pass
 
-import pandas as pd
-import yfinance as yf
-
-try:
-    from pyxirr import xirr
-except ImportError:
-    import subprocess
-    subprocess.run([sys.executable, "-m", "pip", "install", "pyxirr"], check=False)
-    from pyxirr import xirr
-
-import app
+from parsers import load_statements
 from engine import compute_portfolio
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-# ---------------------------------------------------------------------------
-# STEP 1 — read data
-# ---------------------------------------------------------------------------
-
-def load_transactions():
-    txs = app.load_all_transactions()
-    # Same signature dedup the live app uses
-    seen, deduped = set(), []
-    for t in txs:
-        dtag = t["date"].isoformat() if hasattr(t["date"], "isoformat") else str(t["date"])
-        sig = f'{dtag}|{t["ticker"]}|{t["type"]}|{t["qty"]}|{t["price"]}'
-        if sig not in seen:
-            seen.add(sig)
-            deduped.append(t)
-    return deduped
-
-
-def print_data_summary(deduped):
-    print("=" * 64)
-    print("STEP 1 — DATA SOURCES")
-    print("=" * 64)
-    files = [f for f in os.listdir(app.TX_DIR) if not f.startswith(".")]
-    print(f"broker-statements/ contains {len(files)} file(s):")
-    for f in files:
-        print(f"   - {f}")
-    if app.parsing_errors:
-        print("Files skipped (unsupported / duplicate):")
-        for e in app.parsing_errors:
-            print(f"   - {e['file']}: {e['error'][:60]}")
-    from collections import Counter
-    print(f"\nParsed {len(deduped)} transactions after dedup.")
-    print("  by source:", dict(Counter(t["source"] for t in deduped)))
-    print("  by type  :", dict(Counter(t["type"] for t in deduped)))
-    print("Transaction fields available: date, type, ticker, qty, price, fee, source, currency")
-    print("\nNotes / assumptions:")
-    print("  * Portfolio valuation is NOT stored; it is derived mark-to-market from")
-    print("    positions x historical prices (engine.compute_portfolio).")
-    print("  * Month-end = last calendar day present for each month (today for the")
-    print("    current month).")
-    print("  * S&P 500 (^GSPC, adjusted close, USD) is converted to EUR via EURUSD=X")
-    print("    and indexed to 100 at portfolio inception. If FX fetch fails, the USD")
-    print("    index is used and a warning is printed.")
-    print()
-
-
-# ---------------------------------------------------------------------------
-# STEP 2 — metrics
-# ---------------------------------------------------------------------------
-
-def fmt_date(d):
-    return d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)[:10]
-
-
-def build_daily(deduped):
-    """Reuse the engine for the daily valuation/invested/benchmark series
-    (these already-computed metrics are verified and reused), and derive the
-    daily net external cash flow separately for a correct TWR."""
-    d = compute_portfolio(deduped)
-    dates = d["charts"]["dates"]
-    nw = [float(x) for x in d["charts"]["net_worth"]]
-    inv = [float(x) for x in d["charts"]["invested"]]
-
-    netcf = defaultdict(float)          # date -> signed EUR (deposit +, withdrawal -)
-    events = []                          # (date, signed_amount, type)
-    for t in deduped:
-        amt = float(t["qty"]) * float(t["price"])
-        ds = fmt_date(t["date"])
-        if t["type"] == "DEPOSIT":
-            netcf[ds] += amt
-            events.append((ds, amt, "deposit"))
-        elif t["type"] == "WITHDRAWAL":
-            netcf[ds] -= amt
-            events.append((ds, -amt, "withdrawal"))
-    return dates, nw, inv, netcf, events
-
-
-def monthly_twr(monthly_dates, monthly_values, netcf):
-    """Time-Weighted Return via month-end sub-period Modified Dietz, indexed
-    to 100 at inception and continuous (never rebased).
-
-        R_i = (End_i - Begin_i - CF_i) / (Begin_i + 0.5 * CF_i)
-        TWR  = 100 * Π (1 + R_i)
-
-    CF_i (net deposits in the month) is removed from the numerator and half-
-    weighted in the denominator, so the index is independent of deposit size
-    and timing. Per-month R is clamped to [-0.6, 1.0]: a real diversified month
-    never exceeds that, so the clamp only neutralizes valuation glitches (e.g.
-    a month whose reconstructed value is understated by missing price history)
-    instead of letting one bad point flip the whole chain negative.
-    """
-    mflow = defaultdict(float)
-    for ds, amt in netcf.items():
-        mflow[ds[:7]] += amt
-
-    twr = []
-    idx = 100.0
-    prev = None
-    for k, ds in enumerate(monthly_dates):
-        end = monthly_values[k]
-        cf = mflow.get(ds[:7], 0.0)
-        if prev is None:                      # inception month: no prior value
-            twr.append(100.0)
-        else:
-            denom = prev + 0.5 * cf
-            r = (end - prev - cf) / denom if denom > 1e-6 else 0.0
-            r = max(-0.6, min(1.0, r))
-            idx *= (1.0 + r)
-            twr.append(idx)
-        prev = end
-    return twr
+TX_DIR = os.path.join(HERE, "broker-statements")
+OUT_PATH = os.path.join(HERE, "portfolio_performance.html")
 
 
 def month_end_indices(dates):
+    """Index of the last available day of every month (today for the current one)."""
     last = {}
     for i, ds in enumerate(dates):
-        last[ds[:7]] = i           # later index overwrites -> last day of month
+        last[ds[:7]] = i
     return [last[k] for k in sorted(last)]
 
 
-def sp500_eur_indexed(inception, today, monthly_dates):
-    """S&P 500 total-return (adjusted close) in EUR, indexed to 100 at inception,
-    sampled at the supplied month-end dates."""
-    warn = None
-    try:
-        g = yf.download("^GSPC", start=inception, end=today, auto_adjust=True, progress=False)["Close"]
-        if hasattr(g, "columns"):
-            g = g.iloc[:, 0]
-        g = g.dropna()
-        if g.empty:
-            raise ValueError("no ^GSPC data")
-    except Exception as e:
-        print(f"  WARNING: S&P 500 fetch failed ({e}); benchmark will be empty.")
-        return [None] * len(monthly_dates), "S&P 500 fetch failed"
-
-    fx = None
-    try:
-        fx = yf.download("EURUSD=X", start=inception, end=today, auto_adjust=True, progress=False)["Close"]
-        if hasattr(fx, "columns"):
-            fx = fx.iloc[:, 0]
-        fx = fx.dropna()
-        if fx.empty:
-            fx = None
-    except Exception:
-        fx = None
-
-    if fx is None:
-        warn = "EURUSD fetch failed - S&P shown in USD terms (FX not applied)"
-        print(f"  WARNING: {warn}")
-        eur = g.copy()
-    else:
-        idx = g.index.union(fx.index)
-        g2 = g.reindex(idx).ffill()
-        fx2 = fx.reindex(idx).ffill()
-        eur = (g2 / fx2).dropna()          # USD price / (USD per EUR) = EUR price
-
-    base = eur.asof(pd.Timestamp(inception))
-    if base is None or pd.isna(base) or base == 0:
-        base = float(eur.iloc[0])
-    indexed = eur / float(base) * 100.0
-
-    out = []
-    for ds in monthly_dates:
-        v = indexed.asof(pd.Timestamp(ds))
-        out.append(round(float(v), 2) if v is not None and not pd.isna(v) else None)
-    return out, warn
+def print_sources(loaded):
+    print("=" * 64)
+    print("DATA SOURCES")
+    print("=" * 64)
+    for f in loaded.files:
+        print(f"  - {f['file']}  [{f.get('broker')}, {f.get('transactions', 0)} tx kept]")
+    for e in loaded.errors:
+        print(f"  ! {e['file']}: {e['error']}")
+    print(f"\n{len(loaded.transactions)} transactions after merging overlapping statements.")
 
 
-def compute_mwr(deduped, final_value):
-    flows = []
-    for t in deduped:
-        amt = float(t["qty"]) * float(t["price"])
-        dt = t["date"] if isinstance(t["date"], datetime) else pd.to_datetime(t["date"]).to_pydatetime()
-        if t["type"] == "DEPOSIT":
-            flows.append((dt, -amt))
-        elif t["type"] == "WITHDRAWAL":
-            flows.append((dt, amt))
-    flows.append((datetime.now(), final_value))
-    try:
-        rate = xirr(flows)
-        return rate * 100.0 if rate is not None else None
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
-
-def main():
-    deduped = load_transactions()
-    print_data_summary(deduped)
-
-    dates, nw, inv, netcf, events = build_daily(deduped)
-    if not dates:
-        print("No transactions / dates available — aborting.")
+def print_notes(notes):
+    if not notes:
         return
+    print("\nData-quality notes:")
+    for w in notes:
+        prefix = f"{w['file']}: " if w.get("file") else ""
+        print(f"  * {prefix}{w['message']}")
 
+
+def build_report_data(portfolio):
+    ch, k = portfolio["charts"], portfolio["kpis"]
+    dates = ch["dates"]
     me = month_end_indices(dates)
     monthly_dates = [dates[i] for i in me]
 
-    # Invested capital (spec A2) = cumulative net deposits (deposits - withdrawals),
-    # a step function changing only on cash-flow months. (The engine's `inv` series
-    # is cost-basis of holdings, which is a different quantity.)
-    cum, netdep_daily = 0.0, []
-    for ds in dates:
-        cum += netcf.get(ds, 0.0)
-        netdep_daily.append(cum)
+    def pick(series, nd=2):
+        return [None if series[i] is None else round(series[i], nd) for i in me]
 
-    portfolio_value = [round(nw[i], 2) for i in me]
-    invested_capital = [round(netdep_daily[i], 2) for i in me]
-    twr_series = monthly_twr(monthly_dates, [nw[i] for i in me], netcf)
-    twr_monthly = [round(v, 2) for v in twr_series]
+    value, invested = pick(ch["net_worth"]), pick(ch["invested"])
+    twr, sp500 = pick(ch["twr"]), pick(ch["benchmark"])
+    mirror = pick(ch.get("benchmark_value") or [None] * len(dates))
 
-    inception = dates[0]
-    today = date.today().isoformat()
-    sp500, sp_warn = sp500_eur_indexed(inception, today, monthly_dates)
-
-    # Monthly cash-flow markers (aggregate net flow within each month)
-    month_flow = defaultdict(float)
-    for ds, amt, typ in events:
-        month_flow[ds[:7]] += amt
+    # Cash-flow markers: net change in contributions within each month
     markers_abs, markers_twr, marker_info = [], [], []
-    for k, ds in enumerate(monthly_dates):
-        f = month_flow.get(ds[:7], 0.0)
-        if abs(f) > 1e-9:
-            markers_abs.append(portfolio_value[k])
-            markers_twr.append(twr_monthly[k])
-            marker_info.append({"amount": round(abs(f), 2),
-                                "type": "deposit" if f > 0 else "withdrawal"})
+    prev = 0.0
+    for n, i in enumerate(me):
+        flow = ch["invested"][i] - prev
+        prev = ch["invested"][i]
+        if abs(flow) > 0.005:
+            markers_abs.append(value[n])
+            markers_twr.append(twr[n])
+            marker_info.append({"amount": round(abs(flow), 2),
+                                "type": "deposit" if flow > 0 else "withdrawal"})
         else:
             markers_abs.append(None)
             markers_twr.append(None)
             marker_info.append(None)
 
-    # Derived metrics M1-M7
-    m1 = round(nw[-1], 2)
-    m2 = round(netdep_daily[-1], 2)
-    m3 = round(m1 - m2, 2)
-    m4 = round(twr_monthly[-1], 2)
-    m5 = sp500[-1] if sp500 and sp500[-1] is not None else None
-    m6 = round(m4 - m5, 2) if m5 is not None else None
-    m7 = compute_mwr(deduped, nw[-1])
-
-    # ----- STEP 4.1 audit table -----
-    print("=" * 64)
-    print("STEP 2/4 — VERIFICATION TABLE (monthly month-end snapshots)")
-    print("=" * 64)
-    hdr = f"{'date':<12}{'port_value':>14}{'invested':>14}{'TWR':>10}{'S&P500':>10}"
-    print(hdr)
-    print("-" * len(hdr))
-
-    def row(i):
-        sp = sp500[i]
-        sp_s = f"{sp:>10.1f}" if sp is not None else f"{'n/a':>10}"
-        print(f"{monthly_dates[i]:<12}{portfolio_value[i]:>14,.0f}"
-              f"{invested_capital[i]:>14,.0f}{twr_monthly[i]:>10.1f}{sp_s}")
-
-    n = len(monthly_dates)
-    for i in range(min(3, n)):
-        row(i)
-    if n > 6:
-        print(f"{'...':<12}")
-    for i in range(max(3, n - 3), n):
-        row(i)
-
-    print("\nSummary metrics (M1-M7):")
-    print(f"  M1 Portfolio value          : EUR {m1:,.2f}")
-    print(f"  M2 Total invested capital   : EUR {m2:,.2f}")
-    print(f"  M3 Absolute gain            : EUR {m3:,.2f}")
-    print(f"  M4 Portfolio TWR (index)    : {m4:.1f}  ({m4 - 100:+.1f}%)")
-    print(f"  M5 S&P 500 (index)          : {m5:.1f}" if m5 is not None else "  M5 S&P 500 (index)          : n/a")
-    if m6 is not None:
-        print(f"  M6 Alpha vs S&P 500         : {m6:+.1f} pp")
-    else:
-        print("  M6 Alpha vs S&P 500         : n/a")
-    print(f"  M7 MWR / XIRR (annualised)  : {m7:.2f}%" if m7 is not None else "  M7 MWR / XIRR               : n/a")
-
-    # TWR cash-flow-independence sanity check
-    print("\nTWR independence check (a deposit must NOT jump the index):")
-    biggest_dep = max((e for e in events if e[2] == "deposit"), key=lambda x: x[1], default=None)
-    if biggest_dep:
-        ds = biggest_dep[0]
-        try:
-            mi = next(i for i, md in enumerate(monthly_dates) if md[:7] == ds[:7])
-            around = [round(x, 1) for x in twr_monthly[max(0, mi - 1):mi + 2]]
-            print(f"  Largest deposit EUR {biggest_dep[1]:,.0f} on {ds}; TWR index around it: {around}")
-            print("  (the index moves only with market returns, not with the deposit)")
-        except StopIteration:
-            pass
-
-    # Data-quality caveat surfaced by the audit
-    gap_months = sum(1 for k in range(len(monthly_dates))
-                     if invested_capital[k] > 0 and portfolio_value[k] < 0.6 * invested_capital[k])
-    if gap_months:
-        print(f"\n  CAVEAT: {gap_months} month(s) show portfolio value far below invested capital.")
-        print("  The engine reconstructs history from currently-open positions only, so")
-        print("  positions opened-and-later-sold (and tickers lacking price history) are")
-        print("  undervalued in the past. MWR/XIRR and current absolute figures are exact;")
-        print("  TWR/Alpha are directional until historical valuation is completed.")
-
-    # ----- STEP 3/4.2 build + save HTML -----
-    data = {
+    m5 = sp500[-1] if sp500 else None
+    metrics = {
+        "m1": round(k["total_value"], 2),
+        "m2": round(k["net_contributions"], 2),
+        "m3": round(k["total_value"] - k["net_contributions"], 2),
+        "m4": twr[-1] if twr else None,
+        "m5": m5,
+        "m6": round(twr[-1] - m5, 2) if (twr and m5 is not None) else None,
+        "m7": round(k["xirr"], 2) if k["xirr"] is not None else None,
+    }
+    return {
         "labels": [datetime.strptime(d, "%Y-%m-%d").strftime("%b %Y") for d in monthly_dates],
         "rawDates": monthly_dates,
-        "portfolioValue": portfolio_value,
-        "investedCapital": invested_capital,
-        "twr": twr_monthly,
+        "portfolioValue": value,
+        "investedCapital": invested,
+        "twr": twr,
         "sp500": sp500,
+        "mirror": mirror,
+        "comparison": portfolio.get("benchmark") or {},
         "markersAbs": markers_abs,
         "markersTwr": markers_twr,
         "markerInfo": marker_info,
-        "metrics": {"m1": m1, "m2": m2, "m3": m3, "m4": m4,
-                    "m5": m5, "m6": m6, "m7": round(m7, 2) if m7 is not None else None},
-        "spWarn": sp_warn,
+        "metrics": metrics,
+        "spWarn": None if any(v is not None for v in sp500) else "S&P 500 data unavailable",
+        "benchmarkLabel": portfolio["meta"].get("benchmark") or "S&P 500",
     }
-    out_path = os.path.join(HERE, "portfolio_performance.html")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(render_html(data))
 
+
+def print_audit(data):
     print("\n" + "=" * 64)
-    print("STEP 4 — OUTPUT")
+    print("MONTH-END SNAPSHOTS")
     print("=" * 64)
-    print(f"Saved: {out_path}")
+    hdr = f"{'date':<12}{'value':>14}{'net contrib':>14}{'TWR':>10}{'S&P500':>10}"
+    print(hdr)
+    print("-" * len(hdr))
+
+    def fmt(v, width, spec):
+        return f"{v:>{width}{spec}}" if v is not None else f"{'n/a':>{width}}"
+
+    def row(i):
+        print(f"{data['rawDates'][i]:<12}{fmt(data['portfolioValue'][i], 14, ',.0f')}"
+              f"{fmt(data['investedCapital'][i], 14, ',.0f')}{fmt(data['twr'][i], 10, '.1f')}"
+              f"{fmt(data['sp500'][i], 10, '.1f')}")
+
+    n = len(data["rawDates"])
+    head = list(range(min(3, n)))
+    tail = list(range(max(3, n - 3), n))
+    for i in head:
+        row(i)
+    if n > 6:
+        print("...")
+    for i in tail:
+        row(i)
+
+    m = data["metrics"]
+    print("\nSummary:")
+    print(f"  Portfolio value            : EUR {m['m1']:,.2f}")
+    print(f"  Net contributions          : EUR {m['m2']:,.2f}")
+    print(f"  Absolute gain              : EUR {m['m3']:,.2f}")
+    if m["m4"] is not None:
+        print(f"  Portfolio TWR (index)      : {m['m4']:.1f}  ({m['m4'] - 100:+.1f}%)")
+    print("  Benchmark index            : " + (f"{m['m5']:.1f}" if m["m5"] is not None else "n/a")
+          + f"  ({data['benchmarkLabel']})")
+    print("  Alpha vs benchmark         : " + (f"{m['m6']:+.1f} pp" if m["m6"] is not None else "n/a"))
+    print("  MWR / XIRR (annualised)    : " + (f"{m['m7']:.2f}%" if m["m7"] is not None else "n/a"))
+
+    c = data["comparison"]
+
+    def pct(v):
+        return f"{v:.2f}%" if v is not None else "n/a"
+
+    def pp(v):
+        return f"{v:+.2f} pp" if v is not None else "n/a"
+
+    print(f"\nvs S&P 500 ({c.get('start')} – {c.get('end')}):")
+    if c.get("mirror_value") is not None:
+        print(f"  Same deposits in S&P 500   : EUR {c['mirror_value']:,.2f}  "
+              f"(you are {'ahead' if c['value_difference'] >= 0 else 'behind'} by EUR {abs(c['value_difference']):,.2f})")
+    print(f"  Money-weighted (XIRR)      : you {pct(m['m7'])} vs S&P {pct(c.get('mirror_xirr'))}"
+          f"  → {pp(c.get('xirr_difference'))}")
+    twr_pa = None if c.get("cagr") is None or c.get("twr_difference") is None else c["cagr"] + c["twr_difference"]
+    print(f"  Time-weighted (TWR vs CAGR): you {pct(twr_pa)} p.a. vs S&P {pct(c.get('cagr'))} p.a."
+          f"  → {pp(c.get('twr_difference'))}")
 
 
 def render_html(data):
-    payload = json.dumps(data)
+    # "</" would let a value close the <script> element early
+    payload = json.dumps(data).replace("</", "<\\/")
     return HTML_TEMPLATE.replace("/*__DATA__*/", payload)
+
+
+def main():
+    loaded = load_statements(TX_DIR)
+    print_sources(loaded)
+    if not loaded.transactions:
+        print("No transactions found — nothing to report.")
+        return
+    portfolio = compute_portfolio(loaded.transactions)
+    print_notes(list(loaded.warnings) + list(portfolio["warnings"]))
+
+    data = build_report_data(portfolio)
+    print_audit(data)
+    with open(OUT_PATH, "w", encoding="utf-8") as f:
+        f.write(render_html(data))
+    print(f"\nSaved: {OUT_PATH}")
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -448,12 +280,12 @@ function renderCards(){
     c3 = {lbl:'Absolute gain', val:eur(m.m3), cls:m.m3>=0?'pos':'neg'};
     c4 = {lbl:'MWR (XIRR, ann.)', val:m.m7==null?'n/a':pct(m.m7), cls:(m.m7||0)>=0?'pos':'neg'};
   } else {
-    c3 = {lbl:'Portfolio TWR', val:idx1(m.m4), cls:m.m4>=100?'pos':'neg'};
+    c3 = {lbl:'Portfolio TWR', val:m.m4==null?'n/a':idx1(m.m4), cls:(m.m4||0)>=100?'pos':'neg'};
     c4 = {lbl:'Alpha vs. S&P 500', val:m.m6==null?'n/a':pp(m.m6), cls:(m.m6||0)>=0?'pos':'neg'};
   }
   const cards = [
     {lbl:'Portfolio value', val:eur(m.m1), cls:''},
-    {lbl:'Invested capital', val:eur(m.m2), cls:''},
+    {lbl:'Net contributions', val:eur(m.m2), cls:''},
     c3, c4
   ];
   document.getElementById('cards').innerHTML = cards.map(c =>
@@ -465,14 +297,14 @@ function legendHTML(){
   if(mode === 'abs'){
     return [
       ['swatch','background:#378ADD','Portfolio value (EUR)'],
-      ['swatch dash','color:#888780','Invested capital (EUR)'],
-      ['swatch dash','color:#EF9F27','S&P 500 (base 100, right axis)'],
+      ['swatch dash','color:#888780','Net contributions (EUR)'],
+      ['swatch dash','color:#EF9F27','Same deposits in S&P 500 (EUR)'],
       ['swatch dot','background:#E24B4A','Cash flow event'],
     ];
   }
   return [
     ['swatch','background:#1D9E75','Portfolio TWR (base 100)'],
-    ['swatch dash','color:#EF9F27','S&P 500 (base 100)'],
+    ['swatch dash','color:#EF9F27',DATA.benchmarkLabel+' (base 100)'],
     ['swatch dot','background:#E24B4A','Cash flow event (TWR-neutral)'],
   ];
 }
@@ -482,8 +314,8 @@ function renderLegend(){
     `<div class="item"><span class="${cls}" style="${style}"></span>${txt}</div>`
   ).join('');
   document.getElementById('modeNote').textContent = mode === 'abs'
-    ? 'Absolute view: real EUR balances. Invested capital is cumulative net deposits (a step function). The S&P 500 (right axis, base 100) is a scale reference only — not a like-for-like comparison.'
-    : 'Performance view: Time-Weighted Return removes the effect of deposit/withdrawal size and timing, making it directly comparable to the S&P 500. Both indexed to 100 at inception. Cash flow markers sit on the line but do not move the return series.';
+    ? 'Absolute view: real EUR balances. Net contributions are cumulative deposits − withdrawals (a step function). The amber line is what the same deposits and withdrawals would be worth had they gone into the S&P 500 (total return, EUR) on the same days — a like-for-like comparison.'
+    : 'Performance view: Time-Weighted Return removes the effect of deposit/withdrawal size and timing, making it directly comparable to the S&P 500 (in EUR). Both indexed to 100 at inception. Cash flow markers sit on the line but do not move the return series.';
 }
 
 function setMode(m){
@@ -504,10 +336,10 @@ function buildDatasets(showEvents){
     return [
       {label:'Portfolio value', data:DATA.portfolioValue, borderColor:'#378ADD', backgroundColor:'#378ADD',
        borderWidth:2, pointRadius:0, tension:0.3, yAxisID:'y'},
-      {label:'Invested capital', data:DATA.investedCapital, borderColor:'#888780', backgroundColor:'#888780',
+      {label:'Net contributions', data:DATA.investedCapital, borderColor:'#888780', backgroundColor:'#888780',
        borderWidth:1.5, borderDash:[5,3], pointRadius:0, tension:0, yAxisID:'y'},
-      {label:'S&P 500 (base 100)', data:DATA.sp500, borderColor:'#EF9F27', backgroundColor:'#EF9F27',
-       borderWidth:1.5, borderDash:[4,2], pointRadius:0, tension:0.3, yAxisID:'y1'},
+      {label:'Same deposits in S&P 500', data:DATA.mirror, borderColor:'#EF9F27', backgroundColor:'#EF9F27',
+       borderWidth:1.5, borderDash:[4,2], pointRadius:0, tension:0.3, yAxisID:'y'},
       {label:'Cash flow', data:showEvents?DATA.markersAbs:[], parsing:true, showLine:false,
        pointRadius:5, pointHoverRadius:7, pointBackgroundColor:'#E24B4A', pointBorderColor:'#fff',
        pointBorderWidth:1.5, yAxisID:'y'},
@@ -516,7 +348,7 @@ function buildDatasets(showEvents){
   return [
     {label:'Portfolio TWR', data:DATA.twr, borderColor:'#1D9E75', backgroundColor:'#1D9E75',
      borderWidth:2, pointRadius:0, tension:0.3, yAxisID:'y'},
-    {label:'S&P 500', data:DATA.sp500, borderColor:'#EF9F27', backgroundColor:'#EF9F27',
+    {label:'S&P 500 (EUR)', data:DATA.sp500, borderColor:'#EF9F27', backgroundColor:'#EF9F27',
      borderWidth:1.5, borderDash:[5,3], pointRadius:0, tension:0.3, yAxisID:'y'},
     {label:'Cash flow', data:showEvents?DATA.markersTwr:[], showLine:false,
      pointRadius:5, pointHoverRadius:7, pointBackgroundColor:'#E24B4A', pointBorderColor:'#fff',
@@ -531,9 +363,6 @@ function scales(){
   if(mode === 'abs'){
     base.y = {position:'left', grid:{color:gridColor},
       ticks:{color:axisColor,font:{size:11}, callback:v=>'€'+v.toLocaleString('en-US')}};
-    base.y1 = {position:'right', grid:{drawOnChartArea:false},
-      title:{display:true,text:'S&P 500 (base 100)',color:axisColor,font:{size:11}},
-      ticks:{color:axisColor,font:{size:11}}};
   } else {
     base.y = {position:'left', grid:{color:gridColor},
       title:{display:true,text:'Performance index (base 100 = inception)',color:axisColor,font:{size:11}},
@@ -544,6 +373,7 @@ function scales(){
 
 function tooltipLabel(ctx){
   const ds = ctx.dataset.label;
+  if(ctx.raw == null) return null;
   if(ds === 'Cash flow'){
     const info = DATA.markerInfo[ctx.dataIndex];
     if(!info) return null;

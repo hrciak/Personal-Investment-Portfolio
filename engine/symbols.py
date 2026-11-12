@@ -2,29 +2,46 @@
 Symbol resolution
 =================
 
-Turns a broker's instrument identifier into the symbol the price feeds use.
+Turns a broker's instrument identifier into the symbol the price feed uses.
 No per-stock hardcoding: resolution is driven by data already in the statements.
 
-  * ISIN (Trading 212, eToro)  -> Yahoo Finance search API -> e.g. VUSA.L
-  * XTB exchange suffix         -> Yahoo suffix via a small generic table
-                                   (.UK -> .L, .DE -> .DE, .FR -> .PA, ...)
-  * everything else             -> the plain ticker
+  * user override (symbol_overrides.json)  -> whatever the user mapped
+  * crypto                                 -> Yahoo "<TICKER>-EUR" pair
+  * ISIN (Trading 212, eToro)              -> Yahoo Finance search API (e.g. VUSA.L)
+  * XTB exchange suffix                    -> Yahoo suffix via a small generic table
+                                              (.UK -> .L, .DE -> .DE, .FR -> .PA, ...)
+  * everything else                        -> the plain ticker
 
-Resolved symbols are cached to disk (symbol_cache.json) so each ISIN / symbol
-is only looked up once.
+Resolved symbols and their quote currencies are cached on disk
+(symbol_cache.json, gitignored) so each lookup happens only once.
+
+Overrides
+---------
+Create symbol_overrides.json in the project root to fix a symbol the automatic
+resolution gets wrong. Keys are "TICKER" or "Broker:TICKER" (the latter wins);
+values are a Yahoo symbol, or null to disable the price feed for that holding
+(it is then valued at its last trade price):
+
+    {"RHM": "RHM.DE", "Bitpanda:BEST": null}
 """
 
 import os
 import json
+import threading
+
 import requests
 
-_CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "symbol_cache.json")
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_CACHE_PATH = os.path.join(_ROOT, "symbol_cache.json")
+OVERRIDES_PATH = os.path.join(_ROOT, "symbol_overrides.json")
+
+_lock = threading.Lock()
 _cache = None
+_overrides = None
+_NO_FEED = object()  # sentinel: override explicitly disabled the feed
 
 # XTB appends an exchange code to the symbol (VUSA.UK, RHM.DE). Map it to the
-# suffix Yahoo Finance uses. US listings need no suffix. This is ~a dozen
-# generic exchange codes — not a per-instrument list.
+# suffix Yahoo Finance uses. US listings need no suffix.
 EXCHANGE_SUFFIX_MAP = {
     "US": "", "USA": "", "UK": ".L", "GB": ".L", "DE": ".DE", "FR": ".PA",
     "NL": ".AS", "ES": ".MC", "IT": ".MI", "CH": ".SW", "BE": ".BR",
@@ -32,12 +49,22 @@ EXCHANGE_SUFFIX_MAP = {
     "DK": ".CO", "NO": ".OL", "PL": ".WA",
 }
 
+# Quote currency implied by a Yahoo suffix — only a fallback for when the
+# currency lookup fails. London (.L) is ambiguous (GBP vs GBp) and is left to
+# the lookup / the engine's unit check.
+SUFFIX_CURRENCY = {
+    "": "USD", ".DE": "EUR", ".F": "EUR", ".PA": "EUR", ".AS": "EUR", ".MC": "EUR",
+    ".MI": "EUR", ".BR": "EUR", ".LS": "EUR", ".VI": "EUR", ".IR": "EUR",
+    ".HE": "EUR", ".SW": "CHF", ".ST": "SEK", ".CO": "DKK", ".OL": "NOK",
+    ".WA": "PLN", ".TO": "CAD", ".L": "GBp",
+}
+
 _YAHOO_SEARCH = "https://query2.finance.yahoo.com/v1/finance/search"
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # Preferred Yahoo exchange codes per ISIN home country, so an ISIN resolves to
-# its primary listing rather than a thin secondary one (e.g. a US name on the
-# Mexican or Stuttgart exchange). Falls back to any major exchange, then first.
+# its primary listing rather than a thin secondary one. Falls back to any
+# major exchange, then the first equity result.
 _COUNTRY_EXCHANGES = {
     "US": {"NMS", "NYQ", "NGM", "NCM", "ASE", "PCX", "NYS"},
     "GB": {"LSE", "IOB"}, "IE": {"LSE", "ISE", "AMS", "GER"},
@@ -49,24 +76,80 @@ _MAJOR_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "ASE", "PCX", "LSE", "GER",
                     "FRA", "PAR", "AMS", "MIL", "MCE", "EBS", "VTX"}
 
 
-def _load_cache():
+# --------------------------------------------------------------------------
+# Disk cache / overrides
+# --------------------------------------------------------------------------
+
+def _load_cache() -> dict:
     global _cache
     if _cache is None:
         try:
             with open(_CACHE_PATH, "r", encoding="utf-8") as f:
                 _cache = json.load(f)
-        except Exception:
+        except (OSError, ValueError):
             _cache = {}
     return _cache
 
 
-def _save_cache():
+def _save_cache() -> None:
     try:
         with open(_CACHE_PATH, "w", encoding="utf-8") as f:
             json.dump(_cache, f, indent=2, sort_keys=True)
-    except Exception:
-        pass
+    except OSError as e:
+        print(f"symbols: could not write {_CACHE_PATH}: {e}")
 
+
+def cache_get(key: str, default=None):
+    with _lock:
+        return _load_cache().get(key, default)
+
+
+def cache_has(key: str) -> bool:
+    with _lock:
+        return key in _load_cache()
+
+
+def cache_set(key: str, value) -> None:
+    with _lock:
+        _load_cache()[key] = value
+        _save_cache()
+
+
+def load_overrides() -> dict:
+    """Read symbol_overrides.json (re-read on every pipeline run via reset)."""
+    global _overrides
+    if _overrides is None:
+        try:
+            with open(OVERRIDES_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            _overrides = {str(k).strip().upper(): v for k, v in raw.items()}
+        except FileNotFoundError:
+            _overrides = {}
+        except (OSError, ValueError) as e:
+            print(f"symbols: ignoring unreadable {OVERRIDES_PATH}: {e}")
+            _overrides = {}
+    return _overrides
+
+
+def reset() -> None:
+    """Forget in-memory state so edits to the JSON files are picked up."""
+    global _cache, _overrides
+    with _lock:
+        _cache = None
+        _overrides = None
+
+
+def _override_for(ticker: str, source: str):
+    ov = load_overrides()
+    for key in (f"{source}:{ticker}".upper(), ticker.upper()):
+        if key in ov:
+            return _NO_FEED if ov[key] in (None, "") else str(ov[key]).strip()
+    return None
+
+
+# --------------------------------------------------------------------------
+# Resolution
+# --------------------------------------------------------------------------
 
 def _yahoo_symbol_for_isin(isin: str):
     """Query Yahoo's search endpoint for an ISIN and return the best equity
@@ -75,15 +158,13 @@ def _yahoo_symbol_for_isin(isin: str):
     r = requests.get(_YAHOO_SEARCH, params={"q": isin, "quotesCount": 8, "newsCount": 0},
                      headers=_HEADERS, timeout=10)
     if r.status_code != 200:
-        return None
+        raise requests.HTTPError(f"Yahoo search HTTP {r.status_code}")
     quotes = [q for q in r.json().get("quotes", []) if q.get("symbol")]
     if not quotes:
         return None
     equities = [q for q in quotes if q.get("quoteType") in ("EQUITY", "ETF")] or quotes
 
-    country = isin[:2].upper()
-    home = _COUNTRY_EXCHANGES.get(country, set())
-    # 1) home-country listing, 2) any major exchange, 3) first equity
+    home = _COUNTRY_EXCHANGES.get(isin[:2].upper(), set())
     for pref in (home, _MAJOR_EXCHANGES):
         for q in equities:
             if q.get("exchange") in pref:
@@ -92,69 +173,78 @@ def _yahoo_symbol_for_isin(isin: str):
 
 
 def _suffix_from_raw(raw_symbol: str):
-    """Translate an XTB-style 'SYMBOL.EXCHANGE' into a Yahoo symbol, or None."""
+    """Translate an XTB-style 'SYMBOL.EXCHANGE' into a Yahoo symbol, or None.
+    Only the LAST dot is the exchange code ('BRK.B.US' -> base 'BRK.B')."""
     if not raw_symbol or "." not in raw_symbol:
         return None
-    base, _, code = raw_symbol.rpartition(".")
-    code = code.strip().upper()
-    if code in EXCHANGE_SUFFIX_MAP:
-        return base.strip().upper() + EXCHANGE_SUFFIX_MAP[code]
-    return None
+    base, _, code = raw_symbol.strip().rpartition(".")
+    code = code.upper()
+    if code not in EXCHANGE_SUFFIX_MAP or not base:
+        return None
+    suffix = EXCHANGE_SUFFIX_MAP[code]
+    base = base.upper()
+    if suffix == "":
+        base = base.replace(".", "-")  # Yahoo uses BRK-B for US class shares
+    return base + suffix
 
 
-def resolve_symbol(ticker: str, isin: str = None, raw_symbol: str = None) -> str:
-    """Return the Yahoo symbol for a holding. Falls back to the plain ticker.
-    Results are cached on disk keyed by ISIN (preferred) or raw symbol."""
-    cache = _load_cache()
+def resolve_symbol(ticker: str, isin: str = None, raw_symbol: str = None,
+                   source: str = "", asset_class: str = "Stock/ETF"):
+    """Return the Yahoo symbol for a holding, or None when the user disabled
+    its feed. Falls back to the plain ticker."""
+    override = _override_for(ticker, source)
+    if override is _NO_FEED:
+        return None
+    if override:
+        return override
+
+    if asset_class == "Crypto":
+        return f"{ticker.upper()}-EUR"
 
     if isin:
         # US ISINs: Yahoo's ISIN search returns thin foreign cross-listings, but
-        # the broker's ticker IS the US symbol. Use it, normalizing class-share
-        # dots to Yahoo's dashes (BRK.A -> BRK-A). No exchange suffix needed.
+        # the broker's ticker IS the US symbol (BRK.A -> BRK-A).
         if isin[:2].upper() == "US":
-            return ticker.replace(".", "-")
-
+            return ticker.upper().replace(".", "-")
         key = f"isin:{isin}"
-        if key in cache:
-            return cache[key] or ticker
-        try:
-            sym = _yahoo_symbol_for_isin(isin)
-        except Exception:
-            return ticker  # network error — don't cache, retry on a later load
-        cache[key] = sym  # cache definitive hits and misses (200-but-not-found)
-        _save_cache()
-        if sym:
-            return sym
+        if cache_has(key):
+            cached = cache_get(key)
+            if cached:
+                return cached
+        else:
+            try:
+                sym = _yahoo_symbol_for_isin(isin)
+            except (requests.RequestException, ValueError):
+                sym = False  # transient failure — do not cache, retry next load
+            if sym is not False:
+                cache_set(key, sym)  # cache definitive hits and misses
+                if sym:
+                    return sym
 
     if raw_symbol:
-        key = f"sym:{raw_symbol.upper()}"
-        if key in cache:
-            return cache[key] or ticker
         sym = _suffix_from_raw(raw_symbol)
         if sym:
-            cache[key] = sym
-            _save_cache()
             return sym
 
-    return ticker
+    return ticker.upper()
 
 
-def build_symbol_map(transactions: list) -> dict:
-    """Build {ticker: yahoo_symbol} for every non-crypto holding, using the
-    best identifier seen for that ticker across all transactions."""
-    # Gather the richest identifier per ticker (ISIN preferred, then raw symbol)
-    by_ticker = {}
-    for t in transactions:
-        tk = t.get("ticker")
-        if not tk or tk == "CASH":
-            continue
-        info = by_ticker.setdefault(tk, {"isin": None, "raw_symbol": None})
-        if t.get("isin") and not info["isin"]:
-            info["isin"] = t["isin"]
-        if t.get("raw_symbol") and not info["raw_symbol"]:
-            info["raw_symbol"] = t["raw_symbol"]
+def build_symbol_map(instruments: list[dict]) -> dict:
+    """{key: yahoo_symbol_or_None} for instruments given as dicts with keys
+    key, ticker, source, asset_class, isin, raw_symbol."""
+    return {
+        inst["key"]: resolve_symbol(inst["ticker"], inst.get("isin"), inst.get("raw_symbol"),
+                                    inst.get("source", ""), inst.get("asset_class", "Stock/ETF"))
+        for inst in instruments
+    }
 
-    symbol_map = {}
-    for tk, info in by_ticker.items():
-        symbol_map[tk] = resolve_symbol(tk, info["isin"], info["raw_symbol"])
-    return symbol_map
+
+def guess_currency(symbol: str) -> str:
+    """Best-effort quote currency from the Yahoo suffix (fallback only)."""
+    if symbol.endswith("-EUR"):
+        return "EUR"
+    if symbol.endswith("-USD"):
+        return "USD"
+    dot = symbol.rfind(".")
+    suffix = symbol[dot:].upper() if dot > 0 else ""
+    return SUFFIX_CURRENCY.get(suffix, "USD")

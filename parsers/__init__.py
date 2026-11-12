@@ -1,8 +1,5 @@
-from .xtb import parse_xtb_xlsx
-from .bitpanda import parse_bitpanda_csv
-from .etoro import parse_etoro, is_etoro_file
-from .trading212 import parse_trading212_csv, is_trading212_file
-from .base import classify_asset
+from .base import TX_TYPES, Statement, classify_asset, create_transaction
+from .loader import LoadResult, load_statements
 
-__all__ = ["parse_xtb_xlsx", "parse_bitpanda_csv", "parse_etoro", "is_etoro_file",
-           "parse_trading212_csv", "is_trading212_file", "classify_asset"]
+__all__ = ["load_statements", "LoadResult", "Statement", "create_transaction",
+           "classify_asset", "TX_TYPES"]

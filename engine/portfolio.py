@@ -1,588 +1,510 @@
-import datetime
+"""
+Portfolio engine
+================
+
+compute_portfolio(transactions) turns the merged transaction stream from
+parsers.load_statements into everything the dashboard and the CLI reports
+show. Pipeline:
+
+  1. Ledger replay (engine.ledger), snapshotting holdings, cash and external
+     flows at the end of every calendar day.
+  2. Price history in EUR for every holding ever owned (engine.prices), each
+     feed VALIDATED against the prices actually paid/received in the
+     statements: a feed whose median price/trade ratio is far from 1 is a
+     different instrument (symbol collision) or the wrong unit, and is
+     rejected rather than allowed to spike the chart. Gaps are filled with
+     the last observed trade price.
+  3. Daily net worth = cash + sum(units x EUR price); flow-neutral returns,
+     TWR, risk metrics, beta and XIRR (engine.metrics).
+
+The market-data provider is injectable (`market=`) so the engine can be
+tested offline.
+"""
+
+import datetime as dt
 import math
+import statistics
+
 import numpy as np
 import pandas as pd
-from pyxirr import xirr
 
 from parsers.base import classify_asset
-from engine.prices import get_current_prices, get_benchmark_series, get_historical_prices
-from engine.symbols import build_symbol_map
+from engine import metrics
+from engine.ledger import Ledger, position_key
+from engine.prices import YahooMarketData
 
-# A fetched price above this multiple of a position's average cost is treated as
-# a bad data point (wrong-instrument symbol collision or feed glitch) and capped.
-PRICE_SANITY_MULT = 25.0
+POSITION_TYPES = {"BUY", "SELL", "REWARD", "TRANSFER_IN", "TRANSFER_OUT"}
+FLOW_LABELS = {"DEPOSIT": "deposit", "WITHDRAWAL": "withdrawal",
+               "TRANSFER_IN": "transfer in", "TRANSFER_OUT": "transfer out"}
 
-def compute_portfolio(transactions: list[dict]) -> dict:
+VALID_RATIO = (0.4, 2.5)       # accepted median feed/trade price ratio
+UNIT_RATIO = (0.7, 1.4)        # tighter band for accepting a x100 unit correction
+STALE_DAYS = 10                # a feed older than this is not "live"
+NEGATIVE_CASH_WARN = -5.0      # EUR
+
+
+def compute_portfolio(transactions: list, market=None, today: dt.date | None = None) -> dict:
     if not transactions:
-        return _empty_portfolio()
-        
-    df = pd.DataFrame(transactions)
-    df["date"] = pd.to_datetime(df["date"])
-    # Gracefully handle mixed naive/aware parsing
-    if str(df["date"].dtype).startswith("datetime64[ns, "):
-        df["date"] = df["date"].dt.tz_convert(None)
-    elif df["date"].apply(lambda x: getattr(x, 'tzinfo', None) is not None).any():
-        df["date"] = df["date"].apply(lambda x: x.replace(tzinfo=None) if pd.notna(x) else x)
-        
-    df = df.sort_values("date", ascending=True).reset_index(drop=True)
-    
-    # Pre-compute source map, asset-class hints, and resolved Yahoo symbols
-    source_map = df.drop_duplicates("ticker").set_index("ticker")["source"].to_dict()
-    if "asset_class_hint" in df.columns:
-        asset_class_map = (df[df["asset_class_hint"].astype(bool)]
-                           .drop_duplicates("ticker").set_index("ticker")["asset_class_hint"].to_dict())
-    else:
-        asset_class_map = {}
-    symbol_map = build_symbol_map(transactions)
+        return empty_portfolio()
+    market = market or YahooMarketData()
+    txs = _prepare(transactions)
 
-    # 1. POSITIONS & CASH
-    positions_data = {}
-    cash_balance = 0.0
-    dividend_income = 0.0
-    withholding_tax = 0.0
-    total_invested_gross = 0.0
-    total_fees = 0.0
-    
-    cash_flows = []
-    dividends_per_ticker = {}
-    
-    # Track per-source metrics
-    source_metrics = {}
-    
-    for _, row in df.iterrows():
-        dt = row["date"]
-        ticker = row["ticker"]
-        qty = row["qty"]
-        price = row["price"]
-        fee = row["fee"]
-        tx_type = row["type"]
-        real_pnl_val = row["realized_pnl"]
-        
-        cost = (qty * price) + fee if pd.notna(price) else 0.0
-        proceeds = (qty * price) - fee if pd.notna(price) else 0.0
-        total_fees += fee
-        
-        # Track source metrics
-        src = row.get("source", "Unknown")
-        if src not in source_metrics:
-            source_metrics[src] = {"invested": 0.0, "realized_pnl": 0.0, "fees": 0.0, "dividends": 0.0}
-        
-        if tx_type == "DEPOSIT":
-            cash_balance += qty * price
-            cash_flows.append((dt, -(qty * price)))
-            continue
-            
-        elif tx_type == "WITHDRAWAL":
-            cash_balance -= qty * price
-            cash_flows.append((dt, qty * price))
-            continue
-            
-        elif tx_type == "BUY":
-            cash_balance -= cost
-            if ticker != "CASH":
-                if ticker not in positions_data:
-                    positions_data[ticker] = {
-                        "running_qty": 0.0, "running_cost_basis": 0.0,
-                        "total_bought_qty": 0.0, "total_bought_value": 0.0,
-                        "realized_pnl": 0.0, "realized_count": 0, "market_price_at_export": row.get("market_price_at_export")
-                    }
-                p = positions_data[ticker]
-                p["running_qty"] += qty
-                p["total_bought_qty"] += qty
-                p["total_bought_value"] += cost
-                p["running_cost_basis"] += cost
-                total_invested_gross += cost
-                source_metrics[src]["invested"] += cost
-                source_metrics[src]["fees"] += fee
-                cash_flows.append((dt, -cost))
-                
-        elif tx_type == "SELL":
-            cash_balance += proceeds
-            cash_flows.append((dt, proceeds))
-            if ticker != "CASH" and ticker in positions_data:
-                p = positions_data[ticker]
-                # Use running avg cost (cost of remaining shares) not all-time avg
-                avg_cost = p["running_cost_basis"] / p["running_qty"] if p["running_qty"] > 0 else 0
+    first_day = txs[0]["date"].normalize()
+    last_day = max(pd.Timestamp(today or dt.date.today()), txs[-1]["date"].normalize())
+    days = pd.date_range(first_day, last_day, freq="D")
 
-                if pd.notna(real_pnl_val) and real_pnl_val is not None:
-                    realized = real_pnl_val
-                else:
-                    realized = proceeds - (avg_cost * qty)
-                p["realized_pnl"] += realized
+    # 1. replay ------------------------------------------------------------
+    keys = sorted({position_key(t["source"], t["ticker"]) for t in txs if t["type"] in POSITION_TYPES})
+    col = {k: j for j, k in enumerate(keys)}
+    n_days, n_keys = len(days), len(keys)
+    qty = np.zeros((n_days, n_keys))
+    cash = np.zeros(n_days)
+    contrib = np.zeros(n_days)
+    f_in = np.zeros(n_days)
+    f_out = np.zeros(n_days)
+    day_flows = [dict() for _ in range(n_days)]
+    running_cash = []
 
-                p["running_qty"] -= qty
-                p["running_cost_basis"] -= (avg_cost * qty)
-                p["realized_count"] += 1
-                source_metrics[src]["fees"] += fee
-                source_metrics[src]["realized_pnl"] += realized
-                
-        elif tx_type == "DIVIDEND":
-            cash_balance += qty * price
-            dividend_income += qty * price
-            cash_flows.append((dt, qty * price))
-            if ticker != "CASH":
-                if ticker not in dividends_per_ticker:
-                    dividends_per_ticker[ticker] = {"total_eur": 0.0, "last_date": dt, "count": 0}
-                dividends_per_ticker[ticker]["total_eur"] += qty * price
-                dividends_per_ticker[ticker]["last_date"] = dt
-                dividends_per_ticker[ticker]["count"] += 1
-            source_metrics[src]["dividends"] += qty * price
-                
-        elif tx_type == "WITHHOLDING_TAX":
-            cash_balance -= qty * price
-            withholding_tax += qty * price
-            cash_flows.append((dt, -(qty * price)))
+    ledger = Ledger()
+    i = 0
+    for d, day in enumerate(days):
+        day_end = day + pd.Timedelta(days=1)
+        while i < len(txs) and txs[i]["date"] < day_end:
+            tx = txs[i]
+            flow = ledger.apply(tx)
+            f_in[d] += flow["in"]
+            f_out[d] += flow["out"]
+            if tx["type"] in FLOW_LABELS:
+                day_flows[d][tx["type"]] = day_flows[d].get(tx["type"], 0.0) + tx["qty"] * tx["price"]
+            running_cash.append(ledger.cash)
+            i += 1
+        for k, pos in ledger.positions.items():
+            if pos.qty:
+                qty[d, col[k]] = pos.qty
+        cash[d] = ledger.cash
+        contrib[d] = ledger.net_contributions
 
-    # Fetch live prices.
-    # Fallback prices cover EVERY ever-held ticker (not only currently-open ones)
-    # so positions that were opened and later closed can still be valued during
-    # the period they were held. Open positions prefer the export market price;
-    # everything else falls back to its average cost basis.
-    fallback = {}
-    for ticker, p in positions_data.items():
-        if p["running_qty"] > 0 and pd.notna(p["market_price_at_export"]):
-            fallback[ticker] = float(p["market_price_at_export"])
-        elif p["total_bought_qty"] > 0:
-            fallback[ticker] = float(p["total_bought_value"] / p["total_bought_qty"])
+    # 2. prices ------------------------------------------------------------
+    instruments = []
+    for k in keys:
+        p = ledger.positions[k]
+        instruments.append({"key": k, "ticker": p.ticker, "source": p.source, "name": p.name,
+                            "asset_class": classify_asset(p.ticker, p.source, p.asset_class_hint),
+                            "isin": p.isin, "raw_symbol": p.raw_symbol})
+    asset_class = {inst["key"]: inst["asset_class"] for inst in instruments}
+    feeds = market.daily_prices_eur(instruments, first_day.date(), last_day.date()) if instruments else {}
 
-    # Average cost paid per ticker — used as a sanity reference for prices.
-    # A fetched price wildly above what was ever paid (e.g. a Bitpanda micro-token
-    # whose symbol collides with an unrelated Yahoo stock) is a bad data point.
-    avg_cost_map = {}
-    for ticker, p in positions_data.items():
-        if p["total_bought_qty"] > 0:
-            avg_cost_map[ticker] = p["total_bought_value"] / p["total_bought_qty"]
-
-    all_tickers = list(positions_data.keys())
-    active_tickers = [t for t, p in positions_data.items() if p["running_qty"] > 0.0001]
-    current_prices = get_current_prices(active_tickers, fallback, source_map, asset_class_map, symbol_map)
-    
-    # Build final positions map
-    open_positions = []
-    total_market_value = 0.0
-    total_realized_pnl = 0.0
-    total_unrealized_pnl = 0.0
-    allocation = {"Stock/ETF": 0.0, "Crypto": 0.0, "Cash": cash_balance}
-    
-    total_realized_pnl_only = sum(p["realized_pnl"] for p in positions_data.values())
-    total_realized_with_divs = total_realized_pnl_only + dividend_income - withholding_tax
-
-    for ticker, p in positions_data.items():
-        total_realized_pnl += p["realized_pnl"]
-        
-        if p["running_qty"] > 0.0001:
-            qty = p["running_qty"]
-            price = current_prices.get(ticker, 0.0)
-            ac = avg_cost_map.get(ticker, 0.0)
-            # A live price far above average cost is a wrong-instrument match;
-            # a zero/missing price means no quote was found. In both cases fall
-            # back to cost basis so a holding is never shown as a total loss.
-            if ac > 0 and (price <= 0 or price > ac * PRICE_SANITY_MULT):
-                price = ac
-            mkt_val = qty * price
-            cost_basis = p["running_cost_basis"]
-            unrealized = mkt_val - cost_basis
-            unrealized_pct = (unrealized / cost_basis * 100) if cost_basis > 0 else 0
-            avg_cost = p["total_bought_value"] / p["total_bought_qty"] if p["total_bought_qty"] > 0 else 0
-            
-            total_market_value += mkt_val
-            total_unrealized_pnl += unrealized
-            
-            asset_class = classify_asset(ticker, source_map.get(ticker, ""), asset_class_map.get(ticker, ""))
-            if asset_class in allocation:
-                allocation[asset_class] += mkt_val
-                
-            open_positions.append({
-                "ticker": ticker,
-                "asset_class": asset_class,
-                "source": source_map.get(ticker, "Unknown"),
-                "qty": qty,
-                "avg_cost": avg_cost,
-                "price": price,
-                "market_value": mkt_val,
-                "unrealized_pnl": unrealized,
-                "unrealized_pnl_pct": unrealized_pct,
-                "realized_pnl": p["realized_pnl"],
-                "weight_pct": 0.0  # Will be calculated after total is known
-            })
-            
-            if ticker in dividends_per_ticker:
-                dividends_per_ticker[ticker]["yield_pct"] = (dividends_per_ticker[ticker]["total_eur"] / cost_basis * 100) if cost_basis > 0 else 0
-
-    total_portfolio_value = total_market_value + cash_balance
-    total_pnl = total_realized_with_divs + total_unrealized_pnl
-    total_pnl_pct = (total_pnl / total_invested_gross * 100) if total_invested_gross > 0 else 0
-
-    total_invested_capital = total_portfolio_value - total_pnl
-
-    # Calculate position weights and HHI
-    for pos in open_positions:
-        pos["weight_pct"] = (pos["market_value"] / total_portfolio_value * 100) if total_portfolio_value > 0 else 0
-    
-    hhi = sum((pos["weight_pct"] / 100) ** 2 for pos in open_positions) * 10000 if open_positions else 0
-    
-    # Win/Loss analysis from closed positions
-    wins = []
-    losses = []
-    for ticker, p in positions_data.items():
-        if p["realized_count"] > 0:
-            if p["realized_pnl"] > 0:
-                wins.append(p["realized_pnl"])
-            elif p["realized_pnl"] < 0:
-                losses.append(p["realized_pnl"])
-    
-    total_closed = len(wins) + len(losses)
-    win_rate = (len(wins) / total_closed * 100) if total_closed > 0 else None
-    avg_win = (sum(wins) / len(wins)) if wins else 0
-    avg_loss = (sum(losses) / len(losses)) if losses else 0
-    profit_factor = (sum(wins) / abs(sum(losses))) if losses and sum(losses) != 0 else None
-    
-    # Cost drag
-    cost_drag_pct = ((total_fees + withholding_tax) / total_invested_gross * 100) if total_invested_gross > 0 else 0
-    
-    # Dividend yield on cost
-    div_yield_on_cost = (dividend_income / total_invested_gross * 100) if total_invested_gross > 0 else 0
-    
-    # Per-source current holdings (market value, unrealized PnL, open count)
-    per_src_holdings = {}
-    for pos in open_positions:
-        s = pos["source"]
-        d = per_src_holdings.setdefault(s, {"market_value": 0.0, "unrealized_pnl": 0.0, "count": 0})
-        d["market_value"] += pos["market_value"]
-        d["unrealized_pnl"] += pos["unrealized_pnl"]
-        d["count"] += 1
-
-    # Source breakdown for dashboard
-    source_breakdown = []
-    for src_name, metrics in source_metrics.items():
-        h = per_src_holdings.get(src_name, {"market_value": 0.0, "unrealized_pnl": 0.0, "count": 0})
-        source_breakdown.append({
-            "name": src_name,
-            "invested": metrics["invested"],
-            "realized_pnl": metrics["realized_pnl"],
-            "fees": metrics["fees"],
-            "dividends": metrics["dividends"],
-            "market_value": h["market_value"],
-            "unrealized_pnl": h["unrealized_pnl"],
-            "positions_count": h["count"],
+    price = np.zeros((n_days, n_keys))
+    price_report, price_source = [], {}
+    for inst in instruments:
+        k = inst["key"]
+        pos = ledger.positions[k]
+        feed = feeds.get(k)
+        status, ratio, note, series = _validate(feed, pos.price_points, asset_class[k])
+        price[:, col[k]], price_source[k] = _price_column(series, pos, days, last_day, asset_class[k])
+        price_report.append({
+            "key": k, "ticker": pos.ticker, "source": pos.source, "asset_class": asset_class[k],
+            "symbol": feed.symbol if feed else None, "currency": feed.currency if feed else None,
+            "status": status, "validation_ratio": ratio,
+            "note": "; ".join([n for n in ([note] + (feed.notes if feed else [])) if n]),
         })
 
-    # XIRR
-    xirr_val = None
-    if cash_flows:
-        # Terminal flow
-        terminal_flow = list(cash_flows)
-        terminal_flow.append((datetime.datetime.now(), total_portfolio_value))
-        try:
-            xirr_res = xirr(terminal_flow)
-            if xirr_res is not None:
-                xirr_val = xirr_res * 100
-        except Exception:
-            xirr_val = None
+    # 3. valuation & performance --------------------------------------------
+    nw = cash + (qty * price).sum(axis=1)
+    r, capped = metrics.daily_returns(nw, f_in, f_out)
+    twr_idx = metrics.twr_index(r)
+    bench_obs, bench_label = market.benchmark_eur(first_day.date(), last_day.date())
+    bench_obs = _clean_series(bench_obs)
 
-    # NET WORTH TIMESERIES
-    first_date = df["date"].min().date()
-    today = datetime.date.today()
-    
-    date_range = pd.date_range(start=first_date, end=today, freq='D')
-    hist_prices = get_historical_prices(all_tickers, str(first_date), str(today), source_map, asset_class_map, symbol_map)
-    bench_series = get_benchmark_series(str(first_date), str(today))
+    total_value = float(nw[-1])
+    symbol_of = {k: (f.symbol if f else None) for k, f in feeds.items()}
+    positions = _open_positions(ledger, keys, col, qty, price, price_source, asset_class, symbol_of,
+                                ledger.cash)
+    market_value = sum(p["market_value"] for p in positions)
+    unrealized = sum(p["unrealized_pnl"] for p in positions)
+    realized = ledger.realized
+    total_pnl = realized + unrealized + ledger.income_net - ledger.other_fees
+    perf = metrics.performance(r)
 
-    # Pre-align each ticker's price history to the daily range (forward-filled,
-    # leading gaps filled with the cost-basis fallback). This turns the per-day
-    # valuation into an O(1) array lookup instead of re-filtering each series
-    # every day — important now that ALL ever-held tickers are valued.
-    norm_range = date_range.normalize()
-    aligned_prices = {}
-    for t in all_tickers:
-        ps = hist_prices.get(t)
-        if ps is not None and not ps.empty:
-            s = ps.copy()
-            idx = pd.to_datetime(s.index)
-            if getattr(idx, "tz", None) is not None:
-                idx = idx.tz_localize(None)
-            s.index = idx.normalize()
-            s = s[~s.index.duplicated(keep="last")]
-            s = s.reindex(norm_range).ffill()
-            if t in fallback:
-                s = s.fillna(fallback[t])
-            arr = s.to_numpy().copy()
-            # Sanity filter: any price above PRICE_SANITY_MULT x average cost is a
-            # bad data point (wrong-instrument symbol collision / glitch) — cap it
-            # at the cost basis so it cannot spike the chart.
-            ac = avg_cost_map.get(t, 0.0)
-            if ac > 0:
-                arr[arr > ac * PRICE_SANITY_MULT] = ac
-            aligned_prices[t] = arr
-        else:
-            aligned_prices[t] = None  # no series -> scalar fallback used below
+    kpis = {
+        "total_value": total_value,
+        "cash_balance": ledger.cash,
+        "market_value": market_value,
+        "net_contributions": ledger.net_contributions,
+        "total_pnl": total_pnl,
+        "total_pnl_pct": total_pnl / ledger.net_contributions * 100 if ledger.net_contributions > 0 else None,
+        "xirr": metrics.xirr([d.date() for d in days], f_in, f_out, last_day.date(), total_value),
+        "twr": perf["twr"],
+        "twr_annualized": perf["twr_annualized"],
+        "realized_pnl": realized,
+        "unrealized_pnl": unrealized,
+        "dividend_income": ledger.dividends,
+        "interest_income": ledger.interest,
+        "reward_income": ledger.rewards,
+        "withholding_tax": ledger.withholding_tax,
+        "income_net": ledger.income_net,
+        "total_fees": ledger.total_fees,
+        "total_invested": ledger.total_invested,
+        "unreconciled": (total_value - ledger.net_contributions) - total_pnl,
+    }
+    risk = metrics.risk_metrics(r)
+    risk["beta"] = metrics.beta(days, r, bench_obs)
 
-    nw_series = []
-    inv_series = []
-    
-    # Fast timeseries build
-    # Accumulate running qty and cash efficiently
-    # df is sorted by date
-    # Include ALL tickers (not just active) so mid-period holdings show in timeseries
-    all_tickers = list(positions_data.keys())
-    running_qtys = {t: 0.0 for t in all_tickers}
-    running_cash = 0.0
-    running_inv = 0.0
-    # Track per-ticker cost basis for accurate invested capital on sells
-    running_cost_per_ticker = {t: 0.0 for t in all_tickers}
-    running_qty_per_ticker = {t: 0.0 for t in all_tickers}
-    
-    tx_idx = 0
-    num_tx = len(df)
-    
-    dates_list = [d.strftime('%Y-%m-%d') for d in date_range]
-    benchmark_list = []
+    bench_daily = _benchmark_daily(bench_obs, days)
+    mirror = metrics.mirror_values(bench_daily, f_in, f_out)
+    benchmark = _benchmark_comparison(bench_label, bench_daily, mirror, days, f_in, f_out,
+                                      kpis, last_day)
 
-    temp_nw_values = []
-    # Cash-flow markers: net-worth value on days with a deposit/withdrawal (else None)
-    event_values = []
-    event_labels = []
-    # Cash-flow-neutral Time-Weighted Return, indexed to 100 at inception
-    twr_list = []
-    twr_idx = 100.0
-    prev_val = None
-
-    for day_i, current_dt in enumerate(date_range):
-        current_dt_end = current_dt + pd.Timedelta(days=1, microseconds=-1)
-        day_deposit = 0.0
-        day_withdrawal = 0.0
-
-        while tx_idx < num_tx and df.iloc[tx_idx]["date"] <= current_dt_end:
-            row = df.iloc[tx_idx]
-            ticker = row["ticker"]
-            qty = row["qty"]
-            price = row["price"]
-            tx_type = row["type"]
-            fee = row["fee"]
-
-            cost = (qty * price) + fee if pd.notna(price) else 0.0
-            proceeds = (qty * price) - fee if pd.notna(price) else 0.0
-
-            if tx_type == "DEPOSIT":
-                running_cash += qty * price
-                day_deposit += qty * price
-            elif tx_type == "WITHDRAWAL":
-                running_cash -= qty * price
-                day_withdrawal += qty * price
-            elif tx_type == "BUY":
-                running_cash -= cost
-                running_inv += cost
-                if ticker in running_qtys:
-                    running_qtys[ticker] += qty
-                    running_cost_per_ticker[ticker] += cost
-                    running_qty_per_ticker[ticker] += qty
-            elif tx_type == "SELL":
-                running_cash += proceeds
-                # Subtract cost basis of sold units, not proceeds
-                if ticker in running_qtys:
-                    avg_c = running_cost_per_ticker[ticker] / running_qty_per_ticker[ticker] if running_qty_per_ticker[ticker] > 0 else 0
-                    running_inv -= avg_c * qty
-                    running_qtys[ticker] -= qty
-                    running_cost_per_ticker[ticker] -= avg_c * qty
-                    running_qty_per_ticker[ticker] -= qty
-                else:
-                    running_inv -= proceeds
-            elif tx_type == "DIVIDEND":
-                running_cash += qty * price
-            elif tx_type == "WITHHOLDING_TAX":
-                running_cash -= qty * price
-            
-            tx_idx += 1
-            
-        current_dt_str = current_dt.strftime('%Y-%m-%d')
-        daily_val = running_cash
-
-        # Value every ticker still held on this day (open or later-closed)
-        for t in all_tickers:
-            r_qty = running_qtys[t]
-            if r_qty > 0.0001:
-                arr = aligned_prices.get(t)
-                if arr is not None:
-                    p_val = arr[day_i]
-                    if p_val != p_val:  # NaN (price history starts after this day)
-                        p_val = fallback.get(t, 0.0)
-                else:
-                    p_val = fallback.get(t, 0.0)
-                daily_val += r_qty * p_val
-                
-        nw_series.append({"date": current_dt_str, "value": daily_val})
-        inv_series.append({"date": current_dt_str, "value": max(running_inv, 0)})
-        temp_nw_values.append(daily_val)
-        benchmark_list.append(bench_series.get(current_dt_str, None))
-
-        if day_deposit > 0 or day_withdrawal > 0:
-            parts = []
-            if day_deposit > 0:
-                parts.append(f"+€{day_deposit:,.0f} deposit")
-            if day_withdrawal > 0:
-                parts.append(f"−€{day_withdrawal:,.0f} withdrawal")
-            event_values.append(daily_val)
-            event_labels.append(" · ".join(parts))
-        else:
-            event_values.append(None)
-            event_labels.append(None)
-
-        # Daily-linked TWR: remove the day's external flow before measuring the
-        # market return, so deposits/withdrawals never move the index. Per-day
-        # return clamped to +/-50% as a guard against residual price glitches.
-        net_cf_today = day_deposit - day_withdrawal
-        if prev_val is None:
-            twr_list.append(100.0)
-        else:
-            if prev_val > 1.0:
-                r = (daily_val - net_cf_today) / prev_val - 1.0
-                r = max(-0.5, min(0.5, r))
-            else:
-                r = 0.0
-            twr_idx *= (1.0 + r)
-            twr_list.append(twr_idx)
-        prev_val = daily_val
-
-    # RISK METRICS
-    volatility = None
-    annualized_return = None
-    sharpe = None
-    sortino = None
-    calmar = None
-    max_dd = None
-    twr = None
-    
-    if len(temp_nw_values) >= 60:
-        s = pd.Series(temp_nw_values)
-        pct_change = s.pct_change().dropna()
-        if not pct_change.empty:
-            vol = pct_change.std() * math.sqrt(252)
-            ret = ((1 + pct_change.mean()) ** 252) - 1
-            volatility = vol * 100
-            annualized_return = ret * 100
-            
-            # Sharpe ratio (2.5% risk-free rate)
-            sharpe = (annualized_return - 2.5) / volatility if volatility > 0 else 0
-            
-            # Sortino ratio (downside deviation only)
-            downside = pct_change[pct_change < 0]
-            if not downside.empty:
-                downside_dev = downside.std() * math.sqrt(252)
-                sortino = (annualized_return - 2.5) / (downside_dev * 100) if downside_dev > 0 else 0
-            
-            # Max drawdown
-            rolling_max = s.cummax()
-            drawdown = (s - rolling_max) / rolling_max
-            max_dd = drawdown.min() * 100
-            
-            # Calmar ratio (return / |max drawdown|)
-            calmar = (annualized_return / abs(max_dd)) if max_dd and max_dd != 0 else None
-            
-            # Time-Weighted Return
-            cumulative = (1 + pct_change).prod()
-            twr = (cumulative - 1) * 100
-
-    # Format transactions for template
-    tx_out = []
-    rcash = 0.0
-    for _, row in df.iterrows():
-        qty = row["qty"]
-        price = row["price"]
-        fee = row["fee"]
-        tx_type = row["type"]
-        
-        if tx_type == "DEPOSIT": rcash += qty * price
-        elif tx_type == "WITHDRAWAL": rcash -= qty * price
-        elif tx_type == "BUY": rcash -= (qty * price + fee)
-        elif tx_type == "SELL": rcash += (qty * price - fee)
-        elif tx_type == "DIVIDEND": rcash += qty * price
-        elif tx_type == "WITHHOLDING_TAX": rcash -= qty * price
-        
-        # total column in table
-        total_eur = qty * price
-        
-        tx_out.append({
-            "date": row["date"].strftime("%d.%m.%Y %H:%M"),
-            "source": row["source"],
-            "ticker": row["ticker"],
-            "type": row["type"],
-            "qty": row["qty"],
-            "price": row["price"],
-            "total": total_eur,
-            "fee": row["fee"],
-            "running_cash": rcash,
-            "asset_class": classify_asset(row["ticker"], row["source"], asset_class_map.get(row["ticker"], ""))
-        })
-    tx_out.reverse()
-
-    div_list = []
-    for t, d in dividends_per_ticker.items():
-        div_list.append({
-            "ticker": t,
-            "total_eur": d["total_eur"],
-            "count": d["count"],
-            "last_date": d["last_date"].strftime("%d.%m.%Y"),
-            "yield_pct": d.get("yield_pct", 0.0)
-        })
-
-    return {
-        "kpis": {
-            "total_value": total_portfolio_value,
-            "total_pnl": total_pnl,
-            "total_pnl_pct": total_pnl_pct,
-            "xirr": xirr_val,
-            "realized_pnl": total_realized_with_divs,
-            "unrealized_pnl": total_unrealized_pnl,
-            "dividend_income": dividend_income,
-            "total_invested": total_invested_gross,
-            "total_fees": total_fees,
-            "withholding_tax": withholding_tax,
-            "twr": twr
-        },
-        "risk": {
-            "volatility": volatility,
-            "sharpe_ratio": sharpe,
-            "sortino_ratio": sortino,
-            "calmar_ratio": calmar,
-            "max_drawdown": max_dd,
-            "beta": None
-        },
-        "analytics": {
-            "win_rate": win_rate,
-            "avg_win": avg_win,
-            "avg_loss": avg_loss,
-            "profit_factor": profit_factor,
-            "hhi": hhi,
-            "cost_drag_pct": cost_drag_pct,
-            "div_yield_on_cost": div_yield_on_cost,
-            "positions_count": len(open_positions),
-            "closed_count": total_closed
-        },
-        "allocation": allocation,
-        "source_breakdown": source_breakdown,
-        "positions": sorted(open_positions, key=lambda x: x["market_value"], reverse=True),
-        "transactions": tx_out,
-        "dividends": sorted(div_list, key=lambda x: x["total_eur"], reverse=True),
+    result = {
+        "kpis": kpis,
+        "risk": risk,
+        "benchmark": benchmark,
+        "analytics": _analytics(ledger, positions),
+        "allocation": _allocation(positions, ledger.cash),
+        "source_breakdown": _source_breakdown(ledger, positions),
+        "positions": positions,
+        "transactions": _transactions_out(txs, running_cash, asset_class),
+        "dividends": _dividends_out(ledger, positions),
         "charts": {
-            "dates": dates_list,
-            "net_worth": [x["value"] for x in nw_series],
-            "invested": [x["value"] for x in inv_series],
-            "benchmark": benchmark_list,
-            "events": event_values,
-            "event_labels": event_labels,
-            "twr": twr_list
-        }
+            "dates": [d.strftime("%Y-%m-%d") for d in days],
+            "net_worth": nw.tolist(),
+            "invested": contrib.tolist(),
+            "benchmark": _benchmark_index(bench_daily),
+            "benchmark_value": [None if np.isnan(v) else round(float(v), 2) for v in mirror],
+            "events": [float(nw[d]) if day_flows[d] else None for d in range(n_days)],
+            "event_labels": [_flow_label(day_flows[d]) for d in range(n_days)],
+            "twr": twr_idx.tolist(),
+        },
+        "price_report": sorted(price_report, key=lambda x: (x["status"] == "ok", x["key"])),
+        "warnings": _warnings(ledger, positions, price_report, capped),
+        "meta": {"first_date": first_day.strftime("%Y-%m-%d"), "last_date": last_day.strftime("%Y-%m-%d"),
+                 "benchmark": bench_label, "capped_return_days": capped},
+    }
+    return _sanitize(result)
+
+
+# --------------------------------------------------------------------------
+# Preparation & pricing
+# --------------------------------------------------------------------------
+
+def _prepare(transactions: list) -> list:
+    txs = []
+    for t in transactions:
+        ts = pd.Timestamp(t["date"])
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("UTC").tz_localize(None)
+        txs.append({**t, "date": ts, "fee": float(t.get("fee") or 0.0),
+                    "qty": float(t.get("qty") or 0.0), "price": float(t.get("price") or 0.0)})
+    txs.sort(key=lambda x: x["date"])  # stable: keeps the loader's order within a timestamp
+    return txs
+
+
+def _clean_series(s):
+    if s is None or len(s) == 0:
+        return None
+    s = s.dropna()
+    idx = pd.to_datetime(s.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    s = pd.Series(s.to_numpy(dtype=float), index=idx.normalize())
+    return s[~s.index.duplicated(keep="last")].sort_index()
+
+
+def _validate(feed, points, asset_class):
+    """Return (status, median ratio, note, usable EUR series or None)."""
+    if asset_class == "Cash":
+        return "cash", None, "", None
+    series = _clean_series(feed.series) if feed is not None else None
+    if series is None or series.empty:
+        return "missing", None, "no price feed — valued at last trade price", None
+
+    idx = series.index
+    vals = series.to_numpy()
+    ratios = []
+    for date, px in points:
+        if px <= 0:
+            continue
+        day = pd.Timestamp(date).normalize()
+        j = idx.searchsorted(day, side="right") - 1
+        if j >= 0 and (day - idx[j]).days <= 7 and vals[j] > 0:
+            ratios.append(vals[j] / px)
+
+    lo, hi = VALID_RATIO
+    if not ratios:
+        # No trade overlaps the feed. Feeds from an explicit id map are trusted;
+        # ticker-guessed symbols get a coarse collision guard.
+        trusted = str(feed.symbol or "").startswith("coingecko:")
+        ref = max((px for _, px in points if px > 0), default=None)
+        if not trusted and ref and float(series.max()) > 25 * ref:
+            return "rejected", None, "feed price >25x any traded price — likely a different instrument", None
+        return "ok", None, "not verifiable against trade prices", series
+    m = statistics.median(ratios)
+    if lo <= m <= hi:
+        return "ok", m, "", series
+    # Listings quoted in pence/cents when the currency lookup said pounds (or
+    # vice versa): accept only a near-exact x100 mismatch, and never for crypto,
+    # where a 100x-off price is a different coin, not a unit problem.
+    if asset_class != "Crypto":
+        for scale, label in ((0.01, "quoted in minor units (x0.01)"), (100.0, "quoted in major units (x100)")):
+            if UNIT_RATIO[0] <= m * scale <= UNIT_RATIO[1]:
+                return "ok", m * scale, label, series * scale
+    split = _split_hint(m) if asset_class != "Crypto" else None
+    if split:
+        return "rejected", m, (f"feed/trade price ratio {m:.3g} — consistent with a {split} stock split "
+                               "after these trades; valued at the traded prices"), None
+    return "rejected", m, (f"feed/trade price ratio {m:.3g} — wrong instrument or unit; "
+                           "valued at last trade price (fix via symbol_overrides.json)"), None
+
+
+def _split_hint(ratio: float):
+    """'4:1' if a ratio looks like a split adjustment applied after the trades."""
+    for n in (2, 3, 4, 5, 8, 10, 15, 20, 25, 30, 40, 50):
+        if abs(ratio * n - 1) < 0.15:
+            return f"{n}:1"
+        if abs(ratio / n - 1) < 0.15:
+            return f"1:{n} reverse"
+    return None
+
+
+def _price_column(series, pos, days, last_day, asset_class):
+    """Daily EUR price for one holding: validated feed, else last trade price."""
+    if asset_class == "Cash":
+        return np.ones(len(days)), "live"
+    if pos.price_points:
+        pts = pd.Series([p for _, p in pos.price_points],
+                        index=[pd.Timestamp(d).normalize() for d, _ in pos.price_points])
+        pts = pts[pts > 0]
+        fallback = pts.groupby(level=0).last().reindex(days).ffill() if not pts.empty else None
+    else:
+        fallback = None
+
+    source = "cost"
+    if series is not None:
+        feed = series.reindex(series.index.union(days)).ffill().reindex(days)
+        col = feed.to_numpy(dtype=float)
+        if (last_day - series.index[-1]).days <= STALE_DAYS:
+            source = "live"
+    else:
+        col = np.full(len(days), np.nan)
+    if fallback is not None:
+        col = np.where(np.isnan(col), fallback.to_numpy(dtype=float), col)
+    if source != "live" and pos.export_price:
+        col[-1] = pos.export_price          # broker's own mark at export
+        source = "export"
+    return np.nan_to_num(col, nan=0.0), source
+
+
+# --------------------------------------------------------------------------
+# Output sections
+# --------------------------------------------------------------------------
+
+def _open_positions(ledger, keys, col, qty, price, price_source, asset_class, symbol_of, cash):
+    rows = []
+    for k in keys:
+        pos = ledger.positions[k]
+        if not pos.is_open:
+            continue
+        units = float(qty[-1, col[k]])
+        px = float(price[-1, col[k]])
+        mv = units * px
+        unreal = mv - pos.cost
+        rows.append({
+            "key": k, "ticker": pos.ticker, "name": pos.name, "asset_class": asset_class[k],
+            "source": pos.source, "symbol": symbol_of.get(k), "qty": units, "avg_cost": pos.avg_cost,
+            "price": px, "price_source": price_source[k], "market_value": mv,
+            "unrealized_pnl": unreal,
+            "unrealized_pnl_pct": unreal / pos.cost * 100 if pos.cost > 0 else None,
+            "realized_pnl": pos.realized, "weight_pct": 0.0,
+        })
+    gross = sum(r["market_value"] for r in rows) + max(cash, 0.0)
+    for r in rows:
+        r["weight_pct"] = r["market_value"] / gross * 100 if gross > 0 else 0.0
+    rows.sort(key=lambda x: x["market_value"], reverse=True)
+    return rows
+
+
+def _analytics(ledger, positions):
+    wins = [x for x in ledger.trade_results if x > 0]
+    losses = [x for x in ledger.trade_results if x < 0]
+    closed = len(wins) + len(losses)
+    mv_total = sum(p["market_value"] for p in positions)
+    hhi = (sum((p["market_value"] / mv_total) ** 2 for p in positions) * 10000) if mv_total > 0 else 0.0
+    inv = ledger.total_invested
+    return {
+        "win_rate": len(wins) / closed * 100 if closed else None,
+        "avg_win": sum(wins) / len(wins) if wins else 0.0,
+        "avg_loss": sum(losses) / len(losses) if losses else 0.0,
+        "profit_factor": sum(wins) / abs(sum(losses)) if losses else None,
+        "hhi": hhi,
+        "cost_drag_pct": (ledger.total_fees + ledger.withholding_tax) / inv * 100 if inv > 0 else 0.0,
+        "div_yield_on_cost": ledger.dividends / inv * 100 if inv > 0 else 0.0,
+        "positions_count": len(positions),
+        "closed_count": closed,
     }
 
-def _empty_portfolio():
+
+def _allocation(positions, cash):
+    alloc = {"Stock/ETF": 0.0, "Crypto": 0.0, "Cash": max(cash, 0.0)}
+    for p in positions:
+        alloc[p["asset_class"]] = alloc.get(p["asset_class"], 0.0) + p["market_value"]
+    return alloc
+
+
+def _source_breakdown(ledger, positions):
+    out = []
+    for name in sorted(ledger.by_source):
+        s = ledger.by_source[name]
+        held = [p for p in positions if p["source"] == name]
+        out.append({
+            "name": name, "invested": s.invested, "realized_pnl": s.realized_pnl, "fees": s.fees,
+            "dividends": s.dividends, "market_value": sum(p["market_value"] for p in held),
+            "unrealized_pnl": sum(p["unrealized_pnl"] for p in held), "positions_count": len(held),
+            "cash_balance": s.cash, "net_contributions": s.net_contributions,
+        })
+    return out
+
+
+def _transactions_out(txs, running_cash, asset_class):
+    out = []
+    for tx, rc in zip(txs, running_cash):
+        k = position_key(tx["source"], tx["ticker"])
+        cls = asset_class.get(k) or classify_asset(tx["ticker"], tx["source"], tx.get("asset_class_hint", ""))
+        out.append({
+            "date": tx["date"].strftime("%d.%m.%Y %H:%M"),
+            "date_iso": tx["date"].strftime("%Y-%m-%dT%H:%M:%S"),
+            "source": tx["source"], "ticker": tx["ticker"], "type": tx["type"],
+            "qty": tx["qty"], "price": tx["price"], "total": tx["qty"] * tx["price"],
+            "fee": tx["fee"], "running_cash": rc, "asset_class": cls,
+        })
+    out.reverse()
+    return out
+
+
+def _dividends_out(ledger, positions):
+    cost_by_ticker = {}
+    for p in positions:
+        pos = ledger.positions[p["key"]]
+        cost_by_ticker[p["ticker"]] = cost_by_ticker.get(p["ticker"], 0.0) + pos.cost
+    rows = []
+    for ticker, d in ledger.dividends_by_ticker.items():
+        cost = cost_by_ticker.get(ticker, 0.0)
+        rows.append({"ticker": ticker, "total_eur": d["total_eur"], "count": d["count"],
+                     "last_date": pd.Timestamp(d["last_date"]).strftime("%d.%m.%Y"),
+                     "yield_pct": d["total_eur"] / cost * 100 if cost > 0 else 0.0})
+    rows.sort(key=lambda x: x["total_eur"], reverse=True)
+    return rows
+
+
+def _benchmark_daily(bench_obs, days) -> np.ndarray:
+    """Benchmark EUR level on every calendar day (forward-filled), NaN before data."""
+    if bench_obs is None:
+        return np.full(len(days), np.nan)
+    daily = bench_obs.reindex(bench_obs.index.union(days)).ffill().reindex(days)
+    return daily.to_numpy(dtype=float)
+
+
+def _benchmark_index(daily: np.ndarray) -> list:
+    valid = daily[~np.isnan(daily)]
+    if valid.size == 0 or valid[0] <= 0:
+        return [None] * len(daily)
+    return [None if np.isnan(v) else round(float(v / valid[0] * 100.0), 6) for v in daily]
+
+
+def _benchmark_comparison(label, daily, mirror, days, f_in, f_out, kpis, last_day) -> dict:
+    """Two like-for-like comparisons with the benchmark:
+      * money-weighted: your XIRR vs the XIRR of the same cash flows invested in
+        the benchmark (public market equivalent), plus the EUR difference;
+      * time-weighted: your annualized TWR vs the benchmark's CAGR."""
+    mirror_value = None if np.isnan(mirror[-1]) else float(mirror[-1])
+    mirror_xirr = (metrics.xirr([d.date() for d in days], f_in, f_out, last_day.date(), mirror_value)
+                   if mirror_value is not None else None)
+    bench_cagr = metrics.cagr(daily)
+
+    def diff(a, b):
+        return a - b if a is not None and b is not None else None
+
     return {
-        "kpis": {"total_value": 0, "total_pnl": 0, "total_pnl_pct": 0, "xirr": None, "realized_pnl": 0, "unrealized_pnl": 0, "dividend_income": 0, "total_invested": 0, "total_fees": 0, "withholding_tax": 0, "twr": None},
-        "risk": {"volatility": None, "sharpe_ratio": None, "sortino_ratio": None, "calmar_ratio": None, "max_drawdown": None, "beta": None},
-        "analytics": {"win_rate": None, "avg_win": 0, "avg_loss": 0, "profit_factor": None, "hhi": 0, "cost_drag_pct": 0, "div_yield_on_cost": 0, "positions_count": 0, "closed_count": 0},
-        "allocation": {"Stock/ETF": 0, "Crypto": 0, "Cash": 0},
+        "label": label,
+        "start": days[0].strftime("%d.%m.%Y"),
+        "end": days[-1].strftime("%d.%m.%Y"),
+        "years": (days[-1] - days[0]).days / 365.0,
+        "mirror_value": mirror_value,
+        "mirror_xirr": mirror_xirr,
+        "value_difference": diff(kpis["total_value"], mirror_value),
+        "xirr_difference": diff(kpis["xirr"], mirror_xirr),
+        "cagr": bench_cagr,
+        "twr_difference": diff(kpis["twr_annualized"], bench_cagr),
+    }
+
+
+def _flow_label(flows: dict):
+    if not flows:
+        return None
+    parts = []
+    for t in ("DEPOSIT", "TRANSFER_IN", "WITHDRAWAL", "TRANSFER_OUT"):
+        if t in flows:
+            sign = "+" if t in ("DEPOSIT", "TRANSFER_IN") else "−"
+            parts.append(f"{sign}€{flows[t]:,.0f} {FLOW_LABELS[t]}")
+    return " · ".join(parts)
+
+
+def _warnings(ledger, positions, price_report, capped):
+    notes = []
+    for name, s in sorted(ledger.by_source.items()):
+        if s.cash < NEGATIVE_CASH_WARN:
+            notes.append(f"{name}: reconstructed cash balance is −€{-s.cash:,.2f}. Some deposits "
+                         "(or sales) are probably missing from the statements, so returns for this "
+                         "broker are overstated.")
+    for key, units in sorted(ledger.oversold.items()):
+        notes.append(f"{key}: sold {units:,.6g} more units than the statements show were bought — "
+                     "earlier purchases are probably missing.")
+    open_keys = {p["key"] for p in positions}
+    bad = [p for p in price_report if p["key"] in open_keys and p["status"] in ("rejected", "missing")]
+    if bad:
+        names = ", ".join(f"{p['ticker']} ({p['source']})" for p in bad)
+        notes.append(f"No usable live price for {len(bad)} holding(s): {names}. They are valued at "
+                     "their last trade/statement price — see Price sources.")
+    if capped:
+        notes.append(f"{capped} day(s) had an implausible daily return (bad price data) and were "
+                     "capped in the TWR/risk calculations.")
+    return [{"file": None, "message": m} for m in notes]
+
+
+def _sanitize(obj):
+    """Make the result JSON-safe: numpy scalars -> Python, NaN/inf -> None."""
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    if isinstance(obj, np.generic):
+        obj = obj.item()
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
+
+
+def empty_portfolio() -> dict:
+    return {
+        "kpis": {k: 0.0 for k in ("total_value", "cash_balance", "market_value", "net_contributions",
+                                  "total_pnl", "realized_pnl", "unrealized_pnl", "dividend_income",
+                                  "interest_income", "reward_income", "withholding_tax", "income_net",
+                                  "total_fees", "total_invested", "unreconciled")}
+                | {"total_pnl_pct": None, "xirr": None, "twr": None, "twr_annualized": None},
+        "risk": dict.fromkeys(["volatility", "sharpe_ratio", "sortino_ratio", "calmar_ratio",
+                               "max_drawdown", "annualized_return", "beta"]),
+        "benchmark": dict.fromkeys(["label", "start", "end", "years", "mirror_value", "mirror_xirr",
+                                    "value_difference", "xirr_difference", "cagr", "twr_difference"]),
+        "analytics": {"win_rate": None, "avg_win": 0.0, "avg_loss": 0.0, "profit_factor": None,
+                      "hhi": 0.0, "cost_drag_pct": 0.0, "div_yield_on_cost": 0.0,
+                      "positions_count": 0, "closed_count": 0},
+        "allocation": {"Stock/ETF": 0.0, "Crypto": 0.0, "Cash": 0.0},
         "source_breakdown": [],
         "positions": [],
         "transactions": [],
         "dividends": [],
-        "charts": {"dates": [], "net_worth": [], "invested": [], "benchmark": [], "events": [], "event_labels": [], "twr": []}
+        "charts": {"dates": [], "net_worth": [], "invested": [], "benchmark": [], "benchmark_value": [],
+                   "events": [], "event_labels": [], "twr": []},
+        "price_report": [],
+        "warnings": [],
+        "meta": {"first_date": None, "last_date": None, "benchmark": None, "capped_return_days": 0},
     }
